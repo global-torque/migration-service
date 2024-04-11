@@ -400,3 +400,23 @@ func TestExitCode(t *testing.T) {
 		t.Fail()
 	}
 }
+
+func TestMigrationSubFolderOrder(t *testing.T) {
+	// Make sure any subfolders are run after main files
+
+	_log, _, _, _migration, rawPG, _ := testInit()
+	_log.Debug().Msg("checking migration order")
+
+	// we have a bug with random map keys during for loop
+	// so we need to run migration for several times
+	for x := 0; x < 20; x++ {
+		_log, _, _, _migration, rawPG, _ = testInit()
+		// apply migrations for non master branch
+		if err := _migration.ApplyAll("./migrations/TestTriggerFolder"); err != nil {
+			_log.Fatal().Err(err).Msg("cannot apply migrations")
+		}
+
+		checkResultsByService(t, rawPG, _log, "user_users", 2)
+		checkResultsByService(t, rawPG, _log, "user_users_trigger", 1)
+	}
+}

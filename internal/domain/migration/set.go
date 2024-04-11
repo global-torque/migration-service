@@ -91,9 +91,20 @@ func (s *Set) services(priority int) []string {
 		}
 	default:
 		if priorityServices, ok := s.data[priority]; ok {
+			keys := make([]string, 0, len(priorityServices))
+
+			/*
+				From golang documentation:
+					...When iterating over a map with a range loop, the iteration order is not specified and
+					is not guaranteed to be the same from one iteration to the next
+				This causing [a bug](../../../tests/main_test.go#L404) with subfolders
+				So we need to sort services by their name
+			*/
 			for k := range priorityServices {
-				services = append(services, k)
+				keys = append(keys, k)
 			}
+			sort.Strings(keys)
+			services = append(services, keys...)
 		}
 	}
 
@@ -117,7 +128,6 @@ func (s *Set) priorities() []int {
 
 	sort.Ints(priorities)
 	return priorities
-
 }
 
 // serviceMigrations returns migrations for specified service with version > minVersion.
