@@ -96,6 +96,8 @@ set -a && source .dev.env && go run cmd/server/main.go --check-apply ./migration
 ```
 
 # ToDo
-- [ ] fix race condition bug when triggers been executed before main sql execution
 - [ ] refactor app and http using generic responses https://github.com/webdevelop-pro/go-common/tree/master/server/response#response-component
 - [ ] add integration with sqllite
+- [ ] update go-common and logger
+- [ ] remove http server (we don't use it now)
+
