@@ -100,4 +100,5 @@ set -a && source .dev.env && go run cmd/server/main.go --check-apply ./migration
 - [ ] add integration with sqllite
 - [ ] update go-common and logger
 - [ ] remove http server (we don't use it now)
+- [ ] migrate to alpine image, understand how zip works in alpine
 
