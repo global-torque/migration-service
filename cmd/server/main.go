@@ -7,7 +7,7 @@ import (
 
 	"github.com/webdevelop-pro/go-common/configurator"
 	"github.com/webdevelop-pro/go-common/logger"
-	"github.com/webdevelop-pro/lib/server"
+	"github.com/webdevelop-pro/go-common/server"
 	"github.com/webdevelop-pro/migration-service/internal/adapters"
 	"github.com/webdevelop-pro/migration-service/internal/adapters/repository/postgres"
 	"github.com/webdevelop-pro/migration-service/internal/app"
@@ -18,10 +18,10 @@ import (
 
 // @schemes https
 func main() {
-	log := logger.NewComponentLogger("fx", nil)
+	log := logger.NewComponentLogger(context.Background(), "fx")
 
 	fx.New(
-		fx.Logger(log),
+		fx.Logger(&log),
 		fx.Provide(
 			// Configurator
 			configurator.NewConfigurator,
@@ -33,13 +33,11 @@ func main() {
 			app.New,
 			// Bind App with service interface
 			func(mig *app.App) services.Migration { return mig },
-			// Http Server
-			server.New,
 		),
 
 		fx.Invoke(
-			// InitHandlers
-			ports.InitHandlers,
+			// Close DB connections
+			RegisterRepositoryLifecycle,
 			// Run application
 			RunApp,
 		),
@@ -63,135 +61,177 @@ func errorToint(err error) int {
 	return 0
 }
 
-func RunApp(sd fx.Shutdowner, _app *app.App, c *configurator.Configurator, lc fx.Lifecycle, srv *server.HttpServer) {
+func shutdownWithExitCode(sd fx.Shutdowner, err error) {
+	if shutdownErr := sd.Shutdown(fx.ExitCode(errorToint(err))); shutdownErr != nil {
+		log := logger.NewComponentLogger(context.Background(), "shutdown")
+		log.Error().Err(shutdownErr).Msg("failed to shutdown application")
+	}
+}
+
+func RegisterRepositoryLifecycle(lc fx.Lifecycle, repo *postgres.Repository) {
+	lc.Append(
+		fx.Hook{
+			OnStop: func(ctx context.Context) error {
+				repo.Close()
+				return nil
+			},
+		},
+	)
+}
+
+func RunApp(sd fx.Shutdowner, _app *app.App, c *configurator.Configurator, lc fx.Lifecycle) {
 	init := flag.Bool("init", false, "initialize service by creating migration table at DB")
 	finalSql := flag.String("final-sql", "", "if provided - program return final SQL for migrations without applying it. Argument = service name")
 	force := flag.Bool("force", false, "force apply migration without version checking. Accept files or dir paths. Will not update service version if applied version is lower, then already applied")
 	skip := flag.Bool("fake", false, "fake do not apply any migration but mark according migrations in migration_services table as completed")
 	check := flag.Bool("check", false, "check verifies if all hashes of migrations are equal to those in migration table. If no - returns list of files with migrations, that have differences. Can accept files or dirs of migrations as arguments")
 	checkApply := flag.Bool("check-apply", false, "check-apply compares hashes of all migrations with hashes in DB and try to apply those, that have differences. Can accept files or dirs of migrations as arguments")
-	applyOnly := flag.Bool("apply-only", false, "apply and shutdown migration service, do not start web service")
+	applyOnly := flag.Bool("apply-only", true, "apply and shutdown migration service, do not start web service")
+	httpServer := flag.Bool("http", false, "apply migrations and start web service")
 
 	flag.Parse()
 
+	ctx, cancel := context.WithCancel(context.Background())
+	lc.Append(fx.Hook{
+		OnStop: func(context.Context) error {
+			cancel()
+			return nil
+		},
+	})
+
 	if *init {
-		RunInit(sd, _app)
+		RunInit(ctx, sd, _app)
 		return
 	}
 	if *force {
 		args := flag.Args()
-		RunForceApply(sd, _app, args)
+		RunForceApply(ctx, sd, _app, args)
 		return
 	}
 	if *skip {
 		args := flag.Args()
-		RunFakeApply(sd, _app, args)
+		RunFakeApply(ctx, sd, _app, args)
 		return
 	}
 	if *check {
 		args := flag.Args()
-		RunCheck(sd, _app, args, c)
+		RunCheck(ctx, sd, _app, args, c)
 		return
 	}
 	if *checkApply {
 		args := flag.Args()
-		RunCheckApply(sd, _app, args, c)
+		RunCheckApply(ctx, sd, _app, args, c)
 		return
 	}
 	if *finalSql != "" {
-		GetFinalSQL(sd, _app, c, *finalSql)
+		GetFinalSQL(ctx, sd, _app, c, *finalSql)
 		return
 	}
 
-	err := RunMigrations(sd, _app, c)
-	if *applyOnly == false {
-		// Run server
-		RunHttpServer(lc, srv)
-	} else {
-		sd.Shutdown(fx.ExitCode(errorToint(err)))
+	err := RunMigrations(ctx, _app, c)
+	if !shouldRunHTTP(*applyOnly, *httpServer, err) {
+		shutdownWithExitCode(sd, err)
+		return
 	}
+
 	// Run server
-	RunHttpServer(lc, srv)
+	if err := RunHttpServer(lc); err != nil {
+		log := logger.NewComponentLogger(context.Background(), "RunHttpServer")
+		log.Error().Err(err).Msg("error during http server setup")
+		shutdownWithExitCode(sd, err)
+	}
 }
 
-func RunMigrations(sd fx.Shutdowner, _app *app.App, c *configurator.Configurator) error {
-	cfg := c.New("migration", &app.Config{}, "migration").(*app.Config)
-	err := _app.ApplyAll(cfg.Dir)
+func shouldRunHTTP(applyOnly, httpServer bool, err error) bool {
+	return err == nil && (httpServer || !applyOnly)
+}
+
+func RunMigrations(ctx context.Context, _app *app.App, c *configurator.Configurator) error {
+	cfg := c.MustNew("migration", &app.Config{}, "migration").(*app.Config)
+	err := _app.ApplyAllContext(ctx, cfg.Dir)
 	if err != nil {
-		log := logger.NewComponentLogger("RunMigrations", nil)
+		log := logger.NewComponentLogger(context.Background(), "RunMigrations")
 		log.Error().Err(err).Msg("error during migrations")
 	}
 	return err
 }
 
-func RunHttpServer(lc fx.Lifecycle, srv *server.HttpServer) {
+func RunHttpServer(lc fx.Lifecycle) error {
+	srv, err := server.NewServer()
+	if err != nil {
+		return fmt.Errorf("create http server: %w", err)
+	}
+	server.AddDefaultMiddlewares(srv)
+	ports.InitHandlers(srv)
 	server.StartServer(lc, srv)
+
+	return nil
 }
 
-func GetFinalSQL(sd fx.Shutdowner, _app *app.App, c *configurator.Configurator, serviceName string) {
-	cfg := c.New("migration", &app.Config{}, "migration").(*app.Config)
-	sql, err := _app.GetSQL(context.Background(), cfg.Dir, serviceName)
+func GetFinalSQL(ctx context.Context, sd fx.Shutdowner, _app *app.App, c *configurator.Configurator, serviceName string) {
+	cfg := c.MustNew("migration", &app.Config{}, "migration").(*app.Config)
+	sql, err := _app.GetSQL(ctx, cfg.Dir, serviceName)
 	if err != nil {
-		log := logger.NewComponentLogger("GetFinalSQL", nil)
+		log := logger.NewComponentLogger(context.Background(), "GetFinalSQL")
 		log.Error().Err(err).Msg("error during forming sql for migration")
 	}
 	fmt.Println(sql)
-	sd.Shutdown(fx.ExitCode(errorToint(err)))
+	shutdownWithExitCode(sd, err)
 }
 
-func RunInit(sd fx.Shutdowner, _app *app.App) {
-	err := _app.Init(context.Background())
-	log := logger.NewComponentLogger("RunInit", nil)
+func RunInit(ctx context.Context, sd fx.Shutdowner, _app *app.App) {
+	err := _app.Init(ctx)
+	log := logger.NewComponentLogger(context.Background(), "RunInit")
 	if err != nil {
 		log.Error().Err(err).Msg("error during creating migration table")
 	}
 	log.Info().Msg("successfully initialized")
-	sd.Shutdown(fx.ExitCode(errorToint(err)))
+	shutdownWithExitCode(sd, err)
 }
 
-func RunForceApply(sd fx.Shutdowner, _app *app.App, args []string) {
-	err := _app.ForceApply(args)
-	log := logger.NewComponentLogger("RunForceApply", nil)
+func RunForceApply(ctx context.Context, sd fx.Shutdowner, _app *app.App, args []string) {
+	err := _app.ForceApplyContext(ctx, args)
+	log := logger.NewComponentLogger(context.Background(), "RunForceApply")
 	if err != nil {
 		log.Error().Err(err).Msg("error during force apply migrations")
 	}
 	log.Info().Msg("successfully force applied")
-	sd.Shutdown(fx.ExitCode(errorToint(err)))
+	shutdownWithExitCode(sd, err)
 }
 
-func RunFakeApply(sd fx.Shutdowner, _app *app.App, args []string) {
-	err := _app.FakeApply(args)
-	log := logger.NewComponentLogger("RunFakeApply", nil)
+func RunFakeApply(ctx context.Context, sd fx.Shutdowner, _app *app.App, args []string) {
+	err := _app.FakeApplyContext(ctx, args)
+	log := logger.NewComponentLogger(context.Background(), "RunFakeApply")
 	if err != nil {
 		log.Error().Err(err).Msg("error during skip migrations")
 	}
 	log.Info().Msg("successfully skipped and marked as finished")
-	sd.Shutdown(fx.ExitCode(errorToint(err)))
+	shutdownWithExitCode(sd, err)
 }
 
-func RunCheck(sd fx.Shutdowner, _app *app.App, args []string, c *configurator.Configurator) {
-	cfg := c.New("migration", &app.Config{}, "migration").(*app.Config)
+func RunCheck(ctx context.Context, sd fx.Shutdowner, _app *app.App, args []string, c *configurator.Configurator) {
+	cfg := c.MustNew("migration", &app.Config{}, "migration").(*app.Config)
 	if len(args) == 0 {
 		args = append(args, cfg.Dir)
 	}
-	_, _, err := _app.CheckMigrationHash(args)
-	log := logger.NewComponentLogger("RunCheck", nil)
+	_, _, err := _app.CheckMigrationHashContext(ctx, args)
+	log := logger.NewComponentLogger(context.Background(), "RunCheck")
 	if err != nil {
 		log.Error().Err(err).Msg("error during checking migrations")
 	}
-	sd.Shutdown(fx.ExitCode(errorToint(err)))
+	shutdownWithExitCode(sd, err)
 }
 
-func RunCheckApply(sd fx.Shutdowner, _app *app.App, args []string, c *configurator.Configurator) {
-	cfg := c.New("migration", &app.Config{}, "migration").(*app.Config)
+func RunCheckApply(ctx context.Context, sd fx.Shutdowner, _app *app.App, args []string, c *configurator.Configurator) {
+	cfg := c.MustNew("migration", &app.Config{}, "migration").(*app.Config)
 	if len(args) == 0 {
 		args = append(args, cfg.Dir)
 	}
-	err := _app.CheckAndApplyMigrations(args)
-	log := logger.NewComponentLogger("RunCheckApply", nil)
+	err := _app.CheckAndApplyMigrationsContext(ctx, args)
+	log := logger.NewComponentLogger(context.Background(), "RunCheckApply")
 	if err != nil {
 		log.Error().Err(err).Msg("error during checking and applying migrations")
 	}
 
-	sd.Shutdown(fx.ExitCode(errorToint(err)))
+	shutdownWithExitCode(sd, err)
 }

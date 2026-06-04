@@ -4,21 +4,36 @@ on:
       - master
       - dev
 
+permissions:
+  contents: write
+
+env:
+  GO_COMMON_REF: 11c07060d778efcb26834b1c932fd46ce864f4a4
+
 jobs:
   release-linux-amd64:
     name: release linux/amd64
     runs-on: ubuntu-latest
     steps:
-    - uses: actions/checkout@v3
+    - uses: actions/checkout@v6
       with:
         submodules: true
         fetch-depth: 0
+    - uses: actions/checkout@v6
+      with:
+        repository: webdevelop-pro/go-common
+        ref: ${{ env.GO_COMMON_REF }}
+        path: go-common
+        token: ${{ secrets.GO_COMMON_TOKEN || github.token }}
+    - run: ln -sfn "$PWD/go-common" ../go-common
     - uses: wangyoucao577/go-release-action@v1
       with:
         github_token: ${{ secrets.GITHUB_TOKEN }}
         goos: linux
         goarch: amd64
+        goversion: go.mod
         project_path: ./cmd/server
         binary_name: app
+        pre_command: ln -sfn "${GITHUB_WORKSPACE}/go-common" "${GITHUB_WORKSPACE}/../go-common"
         overwrite: true
         release_tag: 0.1

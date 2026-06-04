@@ -1,8 +1,11 @@
+# syntax=docker/dockerfile:1.7
+
 FROM golang:tip-alpine3.22 as build
 
 ARG RELEASE
 
 COPY . /app
+COPY --from=go-common . /go-common
 
 WORKDIR /app
 

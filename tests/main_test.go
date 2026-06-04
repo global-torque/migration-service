@@ -1,33 +1,48 @@
 package main
 
 import (
-	"bufio"
 	"context"
 	"fmt"
-	"io"
 	"os"
 	"os/exec"
+	"strings"
 	"testing"
+	"time"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/rs/zerolog/log"
 	"github.com/webdevelop-pro/go-common/configurator"
+	"github.com/webdevelop-pro/go-common/db"
 	"github.com/webdevelop-pro/go-common/logger"
-	"github.com/webdevelop-pro/lib/db"
+	"github.com/webdevelop-pro/migration-service/internal/adapters"
 	"github.com/webdevelop-pro/migration-service/internal/adapters/repository/postgres"
 	"github.com/webdevelop-pro/migration-service/internal/app"
 	"github.com/webdevelop-pro/migration-service/internal/domain/migration"
+	"github.com/webdevelop-pro/migration-service/internal/domain/migration_log"
 )
 
-func testInit() (logger.Logger, *configurator.Configurator, *postgres.Repository, *app.App, *db.DB, context.Context) {
-	_log := logger.DefaultStdoutLogger("info", nil)
-	c := configurator.NewConfigurator()
-	pg := postgres.New(c)
-	_migration := app.New(c, pg)
-	rawPG := db.New(c)
-	ctx := context.Background()
+func testInit(t *testing.T) (logger.Logger, *configurator.Configurator, *postgres.Repository, *app.App, *db.DB, context.Context) {
+	t.Helper()
+	requireDBEnv(t)
 
-	_, err := rawPG.Exec(context.Background(), "DROP TABLE IF EXISTS email_emails")
+	ctx := context.Background()
+	_log := logger.DefaultStdoutLogger(ctx, "info")
+	c := configurator.NewConfigurator()
+	pg, err := postgres.New()
+	if err != nil {
+		t.Fatalf("cannot create postgres repository: %v", err)
+	}
+	_migration := app.New(c, pg)
+	rawPG, err := db.New(ctx)
+	if err != nil {
+		t.Fatalf("cannot create raw postgres db: %v", err)
+	}
+	t.Cleanup(func() {
+		rawPG.Close()
+		pg.Close()
+	})
+
+	_, err = rawPG.Exec(context.Background(), "DROP TABLE IF EXISTS email_emails")
 	if err != nil {
 		_log.Fatal().Err(err).Msg("can't drop table email_emails from DB")
 	}
@@ -45,6 +60,29 @@ func testInit() (logger.Logger, *configurator.Configurator, *postgres.Repository
 	}
 
 	return _log, c, pg, _migration, rawPG, ctx
+}
+
+func requireDBEnv(t *testing.T) {
+	t.Helper()
+
+	if err := configurator.LoadDotEnv(); err != nil {
+		t.Fatalf("cannot load env file: %v", err)
+	}
+
+	if strings.EqualFold(os.Getenv("SKIP_DB_TESTS"), "true") {
+		t.Skip("skipping DB integration test because SKIP_DB_TESTS=true")
+	}
+
+	required := []string{"DB_TYPE", "DB_USER", "DB_PASSWORD", "DB_DATABASE", "DB_APP_NAME"}
+	missing := make([]string, 0, len(required))
+	for _, key := range required {
+		if strings.TrimSpace(os.Getenv(key)) == "" {
+			missing = append(missing, key)
+		}
+	}
+	if len(missing) > 0 {
+		t.Fatalf("missing DB integration env vars: %s; set SKIP_DB_TESTS=true to skip intentionally", strings.Join(missing, ", "))
+	}
 }
 
 func checkResults(t *testing.T, rawPG *db.DB, log logger.Logger, expName string, expVer int) {
@@ -121,7 +159,7 @@ func checkRecordsCount(t *testing.T, rawPG *db.DB, log logger.Logger, tableName 
 
 // TestIgnoreNonSQLFiles checks if only *.sql files are applied
 func TestIgnoreNonSQLFiles(t *testing.T) {
-	_log, _, pg, _migration, rawPG, ctx := testInit()
+	_log, _, pg, _migration, rawPG, ctx := testInit(t)
 
 	err := pg.CreateMigrationTable(ctx)
 	if err != nil {
@@ -140,7 +178,7 @@ func TestServicePriorities(t *testing.T) {
 	// we will create new _migration for email service
 	// and verify if _migration will be applied in correct order
 	// first user and then _migration
-	_log, _, _, _migration, rawPG, _ := testInit()
+	_log, _, _, _migration, rawPG, _ := testInit(t)
 
 	// Create two different services with different indexes
 	// make sure _migration executed in correct order
@@ -180,7 +218,7 @@ func TestMigrationPriorities(t *testing.T) {
 	// we will create new _migration for email service
 	// and verify if _migration will be applied in correct order
 	// first user and then _migration
-	_log, _, _, _migration, rawPG, _ := testInit()
+	_log, _, _, _migration, rawPG, _ := testInit(t)
 
 	_log.Debug().Msg("trying to apply _migration")
 
@@ -205,7 +243,7 @@ func TestMigrationCommited(t *testing.T) {
 	// we will create new _migration for email service
 	// and verify if _migration will be applied in correct order
 	// first user and then _migration
-	_log, _, _, _migration, rawPG, _ := testInit()
+	_log, _, _, _migration, rawPG, _ := testInit(t)
 
 	_log.Debug().Msg("trying to apply _migration")
 
@@ -226,12 +264,60 @@ func TestMigrationCommited(t *testing.T) {
 	checkResults(t, rawPG, _log, "user_users", 1)
 }
 
+func TestApplyMigrationRollsBackSQLWhenMetadataFails(t *testing.T) {
+	_log, _, pg, _, rawPG, ctx := testInit(t)
+
+	if err := pg.CreateMigrationTable(ctx); err != nil {
+		_log.Fatal().Err(err).Msg("cannot create migration table")
+	}
+	if _, err := rawPG.Exec(ctx, "DROP TABLE migration_service_logs"); err != nil {
+		_log.Fatal().Err(err).Msg("can't drop table migration_service_logs from DB")
+	}
+
+	result, err := pg.ApplyMigration(ctx, adapters.AppliedMigration{
+		ServiceName:   "atomic_metadata",
+		Version:       1,
+		Query:         "CREATE TABLE atomic_metadata_rollback (id int)",
+		UpdateVersion: true,
+		Log: migration_log.MigrationServicesLog{
+			MigrationServiceName: "atomic_metadata",
+			Priority:             1,
+			Version:              1,
+			FileName:             "01_atomic.sql",
+			SQL:                  "CREATE TABLE atomic_metadata_rollback (id int)",
+			Hash:                 "atomic-hash",
+		},
+	})
+	if err == nil {
+		t.Fatal("expected metadata write failure")
+	}
+	if !result.QuerySucceeded {
+		t.Fatal("migration SQL should have succeeded before metadata failure")
+	}
+
+	var tableName *string
+	if err := rawPG.QueryRow(ctx, "SELECT to_regclass('public.atomic_metadata_rollback')").Scan(&tableName); err != nil {
+		_log.Fatal().Err(err).Msg("cannot check rollback table")
+	}
+	if tableName != nil {
+		t.Fatalf("expected migration SQL to roll back, found table %s", *tableName)
+	}
+
+	ver, err := pg.GetServiceVersion(ctx, "atomic_metadata")
+	if err != nil {
+		t.Fatalf("cannot read service version: %v", err)
+	}
+	if ver != 0 {
+		t.Fatalf("expected service version rollback, got %d", ver)
+	}
+}
+
 // TestForceApply checks force apply migrations to db
 func TestForceApply(t *testing.T) {
 	// we will create new migration for user service in first phase
 	// and verify if migration with lower version will be applied by forceApply
 	// and verify, that version of service still 14 after applying version 3
-	_log, _, _, _migration, rawPG, _ := testInit()
+	_log, _, _, _migration, rawPG, _ := testInit(t)
 	_log.Debug().Msg("trying to apply first phase of migrations")
 
 	// First phase - apply init migrations
@@ -254,7 +340,7 @@ func TestForceApply(t *testing.T) {
 func TestFakeApply(t *testing.T) {
 	// we will create new migration for user service in first phase
 	// and verify if migration will be checked as finished without applying
-	_log, _, _, _migration, rawPG, _ := testInit()
+	_log, _, _, _migration, rawPG, _ := testInit(t)
 	_log.Debug().Msg("trying to apply first phase of migrations")
 
 	// First phase - apply init migrations
@@ -277,7 +363,7 @@ func TestFakeApply(t *testing.T) {
 func TestMigrationLog(t *testing.T) {
 	// we will create new migrations for user_user service and verify
 	// if all records was written to migration_service_log
-	_log, _, _, _migration, rawPG, _ := testInit()
+	_log, _, _, _migration, rawPG, _ := testInit(t)
 	_log.Debug().Msg("trying to apply migrations")
 
 	// apply migrations
@@ -293,8 +379,8 @@ func TestMigrationLog(t *testing.T) {
 func TestRequiredEnvInvertion(t *testing.T) {
 	// we will create new migrations for user_user service and verify
 	// if all records was written to migration_service_log
-	os.Setenv("ENV_NAME", "master")
-	_log, _, _, _migration, rawPG, _ := testInit()
+	t.Setenv("ENV_NAME", "master")
+	_log, _, _, _migration, rawPG, _ := testInit(t)
 	_log.Debug().Msg("checking required env comment")
 
 	// apply migrations for non master branch
@@ -312,8 +398,8 @@ func TestRequiredEnvInvertion(t *testing.T) {
 		t.Errorf("query should return an error cause we should not have any migrations for user_users")
 	}
 
-	os.Setenv("ENV_NAME", "dev")
-	_log, _, _, _migration, rawPG, _ = testInit()
+	t.Setenv("ENV_NAME", "dev")
+	_log, _, _, _migration, rawPG, _ = testInit(t)
 	// apply migrations for non master branch
 	if err := _migration.ApplyAll("./migrations/RequiredEnv/BranchInvertion"); err != nil {
 		_log.Fatal().Err(err).Msg("cannot apply migrations")
@@ -327,8 +413,8 @@ func TestRequiredEnvInvertion(t *testing.T) {
 func TestRequiredEnvMultipleBranch(t *testing.T) {
 	// we will create new migrations for user_user service and verify
 	// if all records was written to migration_service_log
-	os.Setenv("ENV_NAME", "master")
-	_log, _, _, _migration, rawPG, _ := testInit()
+	t.Setenv("ENV_NAME", "master")
+	_log, _, _, _migration, rawPG, _ := testInit(t)
 	_log.Debug().Msg("checking required env comment")
 
 	// apply migrations for non master branch
@@ -346,8 +432,8 @@ func TestRequiredEnvMultipleBranch(t *testing.T) {
 		t.Errorf("query should return an error cause we should not have any migrations for user_users")
 	}
 
-	os.Setenv("ENV_NAME", "stage")
-	_log, _, _, _migration, rawPG, _ = testInit()
+	t.Setenv("ENV_NAME", "stage")
+	_log, _, _, _migration, rawPG, _ = testInit(t)
 	// apply migrations for non master branch
 	if err := _migration.ApplyAll("./migrations/RequiredEnv/MultipleBranches"); err != nil {
 		_log.Fatal().Err(err).Msg("cannot apply migrations")
@@ -362,61 +448,80 @@ func TestExitCode(t *testing.T) {
 	// We will run migration with a bad sql
 	// to verify return code
 
-	_log := logger.DefaultStdoutLogger("info", nil)
-	cmd := exec.Command("go", "run", "cmd/server/main.go", "--apply-only")
-	cmd.Env = os.Environ()
+	requireDBEnv(t)
 
-	file, err := os.Open("../.example.env")
-	if err != nil {
-		_log.Error().Err(err).Msg("cannot read default env file")
-		t.Fail()
-		return
-	}
-	defer file.Close()
+	cmd := exec.Command("go", "run", "./cmd/server", "--apply-only")
+	cmd.Dir = ".."
+	cmd.Env = append(os.Environ(),
+		"CORS_ALLOWED_ORIGINS=",
+		"MIGRATION_DIR=./tests/migrations/TestErrorCode",
+	)
 
-	reader := bufio.NewReader(file)
-
-	for {
-		line, _, err := reader.ReadLine()
-
-		if err == io.EOF {
-			break
-		}
-		sline := string(line)
-		// choose different migration dir
-		if len(sline) > 10 && sline[0:10] == "MIGRATION_" {
-			cmd.Env = append(cmd.Env, "MIGRATION_DIR=./tests/migrations/TestErrorCode")
-		} else {
-			cmd.Env = append(cmd.Env, string(line))
-		}
-	}
-
-	// The `Output` method executes the command and
-	// collects the output, returning its value
-	_, err = cmd.Output()
+	output, err := cmd.CombinedOutput()
 	if err == nil {
-		_log.Error().Err(fmt.Errorf("migration should return an error code")).Msg("must had an error")
-		// if there was any error, print it here
-		t.Fail()
+		t.Fatal("expected migration command to return a non-zero exit code")
+	}
+
+	exitErr, ok := err.(*exec.ExitError)
+	if !ok {
+		t.Fatalf("expected process exit error, got %T: %v\n%s", err, err, output)
+	}
+	if exitErr.ExitCode() != 1 {
+		t.Fatalf("expected exit code 1, got %d\n%s", exitErr.ExitCode(), output)
+	}
+	if !strings.Contains(string(output), "failed to apply all migrations") {
+		t.Fatalf("expected migration failure output, got:\n%s", output)
+	}
+}
+
+func TestStartupStopsOnMigrationFailure(t *testing.T) {
+	requireDBEnv(t)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	cmd := exec.CommandContext(ctx, "go", "run", "./cmd/server")
+	cmd.Dir = ".."
+	cmd.Env = append(os.Environ(),
+		"CORS_ALLOWED_ORIGINS=",
+		"MIGRATION_DIR=./tests/migrations/TestErrorCode",
+		"PORT=18085",
+	)
+
+	output, err := cmd.CombinedOutput()
+	if ctx.Err() == context.DeadlineExceeded {
+		t.Fatalf("migration command did not exit after migration failure; it likely continued serving HTTP:\n%s", output)
+	}
+	if err == nil {
+		t.Fatal("expected migration command to return a non-zero exit code")
+	}
+
+	exitErr, ok := err.(*exec.ExitError)
+	if !ok {
+		t.Fatalf("expected process exit error, got %T: %v\n%s", err, err, output)
+	}
+	if exitErr.ExitCode() != 1 {
+		t.Fatalf("expected exit code 1, got %d\n%s", exitErr.ExitCode(), output)
 	}
 }
 
 func TestMigrationSubFolderOrder(t *testing.T) {
 	// Make sure any subfolders are run after main files
 
-	_log, _, _, _migration, rawPG, _ := testInit()
-	_log.Debug().Msg("checking migration order")
-
 	// we have a bug with random map keys during for loop
 	// so we need to run migration for several times
 	for x := 0; x < 20; x++ {
-		_log, _, _, _migration, rawPG, _ = testInit()
-		// apply migrations for non master branch
-		if err := _migration.ApplyAll("./migrations/TestTriggerFolder"); err != nil {
-			_log.Fatal().Err(err).Msg("cannot apply migrations")
-		}
+		t.Run(fmt.Sprintf("iteration_%d", x), func(t *testing.T) {
+			_log, _, _, _migration, rawPG, _ := testInit(t)
+			_log.Debug().Msg("checking migration order")
 
-		checkResultsByService(t, rawPG, _log, "user_users", 2)
-		checkResultsByService(t, rawPG, _log, "user_users_trigger", 1)
+			// apply migrations for non master branch
+			if err := _migration.ApplyAll("./migrations/TestTriggerFolder"); err != nil {
+				_log.Fatal().Err(err).Msg("cannot apply migrations")
+			}
+
+			checkResultsByService(t, rawPG, _log, "user_users", 2)
+			checkResultsByService(t, rawPG, _log, "user_users_trigger", 1)
+		})
 	}
 }

@@ -3,6 +3,12 @@ on:
     tags:
       - v*.**
 
+permissions:
+  contents: write
+
+env:
+  GO_COMMON_REF: 11c07060d778efcb26834b1c932fd46ce864f4a4
+
 jobs:
   releases-matrix:
     name: Release Go Binary
@@ -16,16 +22,25 @@ jobs:
           - goarch: "386"
             goos: darwin
     steps:
-    - uses: actions/checkout@v3
+    - uses: actions/checkout@v6
       with:
         submodules: true  # Fetch Hugo themes (true OR recursive)
         fetch-depth: 0    # Fetch all history for .GitInfo and .Lastmod
+    - uses: actions/checkout@v6
+      with:
+        repository: webdevelop-pro/go-common
+        ref: ${{ env.GO_COMMON_REF }}
+        path: go-common
+        token: ${{ secrets.GO_COMMON_TOKEN || github.token }}
+    - run: ln -sfn "$PWD/go-common" ../go-common
 
     - uses: wangyoucao577/go-release-action@v1
       with:
         github_token: ${{ secrets.GITHUB_TOKEN }}
         goos: ${{ matrix.goos }}
         goarch: ${{ matrix.goarch }}
+        goversion: go.mod
         project_path: "./cmd/server"
         binary_name: app
+        pre_command: ln -sfn "${GITHUB_WORKSPACE}/go-common" "${GITHUB_WORKSPACE}/../go-common"
         overwrite: true

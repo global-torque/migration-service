@@ -29,15 +29,15 @@ func NewMigration(query string, path string) Migration {
 
 	lines := strings.Split(query, "\n")
 	for _, line := range lines {
-		line = strings.Replace(line, "\t", "", -1)
+		line = strings.ReplaceAll(line, "\t", "")
 		// we don't have any comments at all
 		if len(line) < 2 || line[0:2] != "--" {
 			break
 		}
 		if len(line) > 15 && line[0:2] == "--" {
 			comment := line[2:]
-			comment = strings.Replace(comment, " ", "", -1)
-			comment = strings.Replace(comment, "-", "", -1)
+			comment = strings.ReplaceAll(comment, " ", "")
+			comment = strings.ReplaceAll(comment, "-", "")
 			pairs := strings.Split(comment, ",")
 			for _, pair := range pairs {
 				vals := strings.Split(pair, ":")
