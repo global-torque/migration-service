@@ -66,6 +66,22 @@ INSERT INTO service_credentials (service_name, api_key, timeout_seconds)
 VALUES ('payments', ${MIGRATION_PAYMENTS_API_KEY}, ${MIGRATION_TIMEOUT_SECONDS});
 ```
 
+Variable names must match `MIGRATION_[A-Z0-9_]+`. Make every referenced
+variable available to the migration-service process through its shell,
+container, or deployment secret configuration before applying the migration:
+
+```sh
+export MIGRATION_PAYMENTS_API_KEY="<injected secret>"
+export MIGRATION_TIMEOUT_SECONDS="30"
+MIGRATION_DIR=./migrations/ ./app --apply-only=true
+```
+
+Every replacement is a PostgreSQL string literal. Add an explicit cast when
+the intended type would otherwise be unclear, for example
+`${MIGRATION_TIMEOUT_SECONDS}::integer`, `${MIGRATION_TENANT_ID}::uuid`, or
+`${MIGRATION_RULES_JSON}::jsonb`. Do not put quotes around the placeholder;
+`'${MIGRATION_PAYMENTS_API_KEY}'` is rejected.
+
 The runner renders each value as a PostgreSQL string literal, so quotes,
 newlines, and SQL-like content in a value cannot change the SQL structure when
 the placeholder passes this validation.
