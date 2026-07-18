@@ -55,6 +55,55 @@ will apply all new migrations locally
 ## Env variables
 check `.example.env` file 
 
+### Variables in migration SQL
+
+Environment variables whose names start with `MIGRATION_` can be inserted as
+values during migration execution. Use an unquoted `${MIGRATION_NAME}`
+placeholder as a standalone value token in the SQL file:
+
+```sql
+INSERT INTO service_credentials (service_name, api_key, timeout_seconds)
+VALUES ('payments', ${MIGRATION_PAYMENTS_API_KEY}, ${MIGRATION_TIMEOUT_SECONDS});
+```
+
+The runner renders each value as a PostgreSQL string literal, so quotes,
+newlines, and SQL-like content in a value cannot change the SQL structure when
+the placeholder passes this validation.
+PostgreSQL will coerce the literal when the destination is another type, such
+as an integer, UUID, or JSON column. Placeholders are for values only; they
+cannot be used for identifiers or raw SQL fragments, and they must not be
+surrounded by single quotes. The runner rejects placeholders inside line or
+block comments, single-quoted strings, double-quoted identifiers, and
+dollar-quoted data or function bodies. It also rejects placeholders touching
+an identifier character. To avoid depending on the session's
+`standard_conforming_strings` setting, a variable-bearing migration also
+rejects backslashes inside ordinary SQL strings; use an explicit `E'...'`
+escape string when needed. Put dynamic procedural values in a top-level DML
+statement rather than inside a `DO` or function body.
+
+An unset variable fails the migration before its SQL is sent to PostgreSQL. An
+explicitly set empty value is allowed. Variable-resolution errors are always
+fatal, even when the migration uses `allow_error: true`. Migration hashes,
+migration-service application logs, rows in `migration_service_logs`, and the
+`--final-sql` output retain the placeholder rather than storing the resolved
+value. PostgreSQL execution error details are redacted by the runner because
+they can echo input values; the wrapped database error remains available to Go
+callers through `errors.Is` and `errors.As`. The migration repository also
+disables pgx SQL tracing regardless of `DB_LOG_LEVEL`, because that tracer logs
+complete rendered statements.
+
+The resolved value must still be sent to PostgreSQL. PostgreSQL statement,
+audit, or parameter logging can therefore record it outside the migration
+service. Review those database-side logging settings before using this feature
+for secrets. PostgreSQL can log a failed statement by default; secret-bearing
+migration jobs need appropriately restricted database roles and operator-owned
+settings for statement/error/duration/audit logging and `pg_stat_activity`
+access. If database-side query-text secrecy is mandatory, do not use textual
+SQL variables.
+
+Because `--final-sql` intentionally retains placeholders, its output is an
+audit/debug view and is not directly executable by PostgreSQL.
+
 ## Application options
 
 ### --init
@@ -101,4 +150,3 @@ set -a && source .dev.env && go run cmd/server/main.go --check-apply ./migration
 - [ ] update go-common and logger
 - [ ] remove http server (we don't use it now)
 - [ ] migrate to alpine image, understand how zip works in alpine
-

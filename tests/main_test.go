@@ -7,6 +7,7 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"strings"
 	"testing"
 
 	"github.com/jackc/pgx/v5"
@@ -287,6 +288,51 @@ func TestMigrationLog(t *testing.T) {
 	checkResultsByService(t, rawPG, _log, "user_users", 3)
 	checkRecordsCount(t, rawPG, _log, "migration_service_logs", 3)
 	checkValueResults(t, rawPG, _log, "03_add_bitint.sql", "migration_service_logs", "file_name", 3)
+}
+
+func TestMigrationVariables(t *testing.T) {
+	const secret = "pa'ssword; DROP TABLE migration_services; -- $migration_variable$"
+	t.Setenv("MIGRATION_TEST_SECRET_VALUE", secret)
+	t.Setenv("MIGRATION_TEST_DYNAMIC_NUMBER", "42")
+	t.Setenv("MIGRATION_TEST_EMPTY_VALUE", "")
+
+	_log, _, _, _migration, rawPG, _ := testInit()
+	if _, err := rawPG.Exec(context.Background(), "DROP TABLE IF EXISTS migration_variables"); err != nil {
+		t.Fatalf("cannot drop migration_variables: %v", err)
+	}
+	t.Cleanup(func() {
+		_, _ = rawPG.Exec(context.Background(), "DROP TABLE IF EXISTS migration_variables")
+	})
+
+	if err := _migration.ApplyAll("./migrations/TestMigrationVariables"); err != nil {
+		_log.Error().Err(err).Msg("cannot apply migration variables test")
+		t.Fatal(err)
+	}
+
+	var gotSecret, gotEmpty string
+	var gotNumber int
+	err := rawPG.QueryRow(
+		context.Background(),
+		"SELECT secret_value, dynamic_number, empty_value FROM migration_variables LIMIT 1",
+	).Scan(&gotSecret, &gotNumber, &gotEmpty)
+	if err != nil {
+		t.Fatalf("cannot read migration_variables: %v", err)
+	}
+	if gotSecret != secret || gotNumber != 42 || gotEmpty != "" {
+		t.Fatalf("inserted values = (%q, %d, %q), want (%q, 42, empty)", gotSecret, gotNumber, gotEmpty, secret)
+	}
+
+	var loggedSQL string
+	err = rawPG.QueryRow(
+		context.Background(),
+		"SELECT sql FROM migration_service_logs WHERE migration_services_name = 'variables' AND version = 1",
+	).Scan(&loggedSQL)
+	if err != nil {
+		t.Fatalf("cannot read migration log: %v", err)
+	}
+	if strings.Contains(loggedSQL, secret) || !strings.Contains(loggedSQL, "${MIGRATION_TEST_SECRET_VALUE}") {
+		t.Fatalf("migration log does not retain the secret-free placeholder: %q", loggedSQL)
+	}
 }
 
 // TestMigrationLog checks writing logs to migration_service_logs table

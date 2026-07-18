@@ -195,6 +195,7 @@ func (s *Set) Apply(name string, priority, minVersion, curVersion int, envName s
 
 			var err error
 			var regexRes bool
+			execute := true
 			if mig.EnvRegex != "" {
 				doMatch := true
 				if mig.EnvRegex[0] == '!' {
@@ -202,15 +203,26 @@ func (s *Set) Apply(name string, priority, minVersion, curVersion int, envName s
 					mig.EnvRegex = mig.EnvRegex[1:len(mig.EnvRegex)]
 				}
 				regexRes, err = regexp.MatchString(mig.EnvRegex, envName)
-				if regexRes == doMatch && err == nil {
-					err = s.repo.Exec(context.Background(), mig.Query)
-				} else {
+				if regexRes != doMatch || err != nil {
 					s.log.Debug().Msgf("do not match selection with required_env: %s and %s", mig.EnvRegex, envName)
-					continue
+					execute = false
 				}
-			} else {
-				err = s.repo.Exec(context.Background(), mig.Query)
 			}
+			if !execute {
+				continue
+			}
+
+			query, expandErr := expandMigrationVariables(mig.Query)
+			if expandErr != nil {
+				return n, lastVersion, errors.Wrapf(
+					expandErr,
+					"migration(%d) variable expansion failed, file: %s",
+					ver,
+					mig.Path,
+				)
+			}
+			err = s.repo.Exec(context.Background(), query)
+			err = redactMigrationVariableExecutionError(mig.Query, err)
 
 			if err != nil {
 				s.log.Error().Msgf("not executed query: \n%s\n for %s, version: %d, file: %s", mig.Query, name, ver, mig.Path)

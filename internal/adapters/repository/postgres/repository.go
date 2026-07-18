@@ -8,6 +8,7 @@ import (
 	"github.com/pkg/errors"
 	"github.com/webdevelop-pro/go-common/configurator"
 	"github.com/webdevelop-pro/go-common/db"
+	"github.com/webdevelop-pro/go-common/logger"
 	"github.com/webdevelop-pro/migration-service/internal/domain/migration_log"
 )
 
@@ -19,8 +20,15 @@ type Repository struct {
 
 // New returns new DB instance.
 func New(c *configurator.Configurator) *Repository {
+	poolConfig := db.GetConfigPool(c)
+	// Migration SQL may contain rendered secrets. The shared pgx tracer records
+	// complete SQL statements, so it must remain disabled for this repository
+	// regardless of DB_LOG_LEVEL.
+	poolConfig.ConnConfig.Tracer = nil
+	pool := db.NewPoolFromConfig(poolConfig)
+
 	return &Repository{
-		db: db.New(c),
+		db: db.NewDB(pool, logger.NewComponentLogger("migration-db", nil)),
 	}
 }
 
