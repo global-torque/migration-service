@@ -1,24 +1,120 @@
+name: Publish latest Linux build
+
 on:
   push:
     branches:
       - master
       - dev
 
+permissions: {}
+
+concurrency:
+  group: migration-service-latest-release
+  cancel-in-progress: false
+
+env:
+  GO_VERSION: "1.26.5"
+  RELEASE_TAG: "0.1"
+
 jobs:
-  release-linux-amd64:
-    name: release linux/amd64
+  test:
+    name: Test
     runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
     steps:
-    - uses: actions/checkout@v3
-      with:
-        submodules: true
-        fetch-depth: 0
-    - uses: wangyoucao577/go-release-action@v1
-      with:
-        github_token: ${{ secrets.GITHUB_TOKEN }}
-        goos: linux
-        goarch: amd64
-        project_path: ./cmd/server
-        binary_name: app
-        overwrite: true
-        release_tag: 0.1
+      - name: Check out source
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+          submodules: recursive
+
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache-dependency-path: go.sum
+
+      - name: Run unit tests
+        run: go test ./... -run Unit -count=1
+
+      - name: Run vet
+        run: go vet ./...
+
+  build:
+    name: Build linux/amd64
+    needs: test
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - name: Check out source
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+          submodules: recursive
+
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache-dependency-path: go.sum
+
+      - name: Build release archive
+        env:
+          GOOS: linux
+          GOARCH: amd64
+        run: |
+          set -euo pipefail
+          archive="app-${RELEASE_TAG}-${GOOS}-${GOARCH}.tar.gz"
+          mkdir -p build dist
+          go build -o build/app ./cmd/server
+          tar -C build -czf "dist/${archive}" app
+          md5sum "dist/${archive}" | awk '{print $1}' > "dist/${archive}.md5"
+
+      - name: Upload release files
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: latest-linux-amd64
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 1
+
+  publish:
+    name: Publish 0.1 release
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - name: Download release files
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: latest-linux-amd64
+          path: dist
+
+      - name: Verify release files
+        run: |
+          set -euo pipefail
+          archive="dist/app-${RELEASE_TAG}-linux-amd64.tar.gz"
+          test -f "${archive}"
+          test -f "${archive}.md5"
+          expected=$(tr -d '[:space:]' < "${archive}.md5")
+          actual=$(md5sum "${archive}" | awk '{print $1}')
+          test "${actual}" = "${expected}"
+
+      - name: Publish release files
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          if ! gh release view "${RELEASE_TAG}" >/dev/null 2>&1; then
+            gh release create "${RELEASE_TAG}" --verify-tag --title "${RELEASE_TAG}" --notes "Automated latest migration-service build."
+          fi
+          gh release upload "${RELEASE_TAG}" dist/* --clobber
