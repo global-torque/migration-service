@@ -120,6 +120,27 @@ SQL variables.
 Because `--final-sql` intentionally retains placeholders, its output is an
 audit/debug view and is not directly executable by PostgreSQL.
 
+### Environment-scoped identifiers
+
+Migration SQL may use the exact `{{ ENV_NAME }}` marker inside an unquoted
+PostgreSQL identifier, for example:
+
+```sql
+CREATE ROLE svc_{{ ENV_NAME }}_queue_api NOLOGIN;
+```
+
+The runner renders this marker only immediately before execution. `ENV_NAME`
+must be set and match `[a-z][a-z0-9_]*`; the complete generated identifier must
+be at most 63 bytes. Unknown, nested, quoted, commented, or dollar-quoted
+template markers are rejected. This is the only supported identifier
+interpolation—use `${MIGRATION_*}` only for standalone SQL values.
+For marker-bearing SQL, an ordinary single-quoted string containing a
+backslash is also rejected because its parsing depends on
+`standard_conforming_strings`; use an explicit `E'...'` escape string.
+
+Hashes, migration logs, and `--final-sql` retain the canonical unrendered SQL,
+so the migration identity is stable across environments.
+
 ## Application options
 
 ### --init

@@ -212,7 +212,16 @@ func (s *Set) Apply(name string, priority, minVersion, curVersion int, envName s
 				continue
 			}
 
-			query, expandErr := expandMigrationVariables(mig.Query)
+			query, renderErr := renderEnvironmentIdentifier(mig.Query, envName)
+			if renderErr != nil {
+				return n, lastVersion, errors.Wrapf(
+					renderErr,
+					"migration(%d) identifier rendering failed, file: %s",
+					ver,
+					mig.Path,
+				)
+			}
+			query, expandErr := expandMigrationVariables(query)
 			if expandErr != nil {
 				return n, lastVersion, errors.Wrapf(
 					expandErr,
