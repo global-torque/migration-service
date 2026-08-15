@@ -66,6 +66,7 @@ jobs:
 
       - name: Build release archive
         env:
+          CGO_ENABLED: "0"
           GOOS: linux
           GOARCH: amd64
         run: |
@@ -73,6 +74,9 @@ jobs:
           archive="app-${RELEASE_TAG}-${GOOS}-${GOARCH}.tar.gz"
           mkdir -p build dist
           go build -o build/app ./cmd/server
+          test "$(go env CGO_ENABLED)" = "0"
+          file build/app | tee /tmp/migration-service-file-output
+          grep -q "statically linked" /tmp/migration-service-file-output
           tar -C build -czf "dist/${archive}" app
           md5sum "dist/${archive}" | awk '{print $1}' > "dist/${archive}.md5"
 
