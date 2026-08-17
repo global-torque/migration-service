@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strings"
 	"sync"
@@ -27,7 +28,7 @@ func New(repo adapters.Repository) *Set {
 	return &Set{
 		data: make(map[int]map[string]map[int][]Migration),
 		repo: repo,
-		log:  logger.NewDefaultComponent("migration"),
+		log:  logger.NewComponentLogger("migration", nil),
 	}
 }
 
@@ -90,9 +91,20 @@ func (s *Set) services(priority int) []string {
 		}
 	default:
 		if priorityServices, ok := s.data[priority]; ok {
+			keys := make([]string, 0, len(priorityServices))
+
+			/*
+				From golang documentation:
+					...When iterating over a map with a range loop, the iteration order is not specified and
+					is not guaranteed to be the same from one iteration to the next
+				This causing [a bug](../../../tests/main_test.go#L404) with subfolders
+				So we need to sort services by their name
+			*/
 			for k := range priorityServices {
-				services = append(services, k)
+				keys = append(keys, k)
 			}
+			sort.Strings(keys)
+			services = append(services, keys...)
 		}
 	}
 
@@ -116,7 +128,6 @@ func (s *Set) priorities() []int {
 
 	sort.Ints(priorities)
 	return priorities
-
 }
 
 // serviceMigrations returns migrations for specified service with version > minVersion.
@@ -161,7 +172,7 @@ func (s *Set) serviceMigrations(name string, priority, minVersion int) map[int][
 }
 
 // Apply applies migrations for specified service with version > minVersion.
-func (s *Set) Apply(name string, priority, minVersion, curVersion int) (int, int, error) {
+func (s *Set) Apply(name string, priority, minVersion, curVersion int, envName string) (int, int, error) {
 	migrations := s.serviceMigrations(name, priority, minVersion)
 
 	var n, lastVersion int
@@ -175,23 +186,62 @@ func (s *Set) Apply(name string, priority, minVersion, curVersion int) (int, int
 
 	for ver := range migrations {
 		versions[i] = ver
-
 		i++
 	}
 	sort.Ints(versions)
 
 	for _, ver := range versions {
 		for _, mig := range migrations[ver] {
+			var err error
+			var regexRes bool
+			execute := true
+			if mig.EnvRegex != "" {
+				doMatch := true
+				if mig.EnvRegex[0] == '!' {
+					doMatch = false
+					mig.EnvRegex = mig.EnvRegex[1:len(mig.EnvRegex)]
+				}
+				regexRes, err = regexp.MatchString(mig.EnvRegex, envName)
+				if regexRes != doMatch || err != nil {
+					s.log.Debug().Msgf("do not match selection with required_env: %s and %s", mig.EnvRegex, envName)
+					execute = false
+				}
+			}
+			if !execute {
+				continue
+			}
 
-			err := s.repo.Exec(context.Background(), mig.Query)
+			query, renderErr := renderEnvironmentIdentifier(mig.Query, envName)
+			if renderErr != nil {
+				return n, lastVersion, errors.Wrapf(
+					renderErr,
+					"migration(%d) identifier rendering failed, file: %s",
+					ver,
+					mig.Path,
+				)
+			}
+			query, expandErr := expandMigrationVariables(query)
+			if expandErr != nil {
+				return n, lastVersion, errors.Wrapf(
+					expandErr,
+					"migration(%d) variable expansion failed, file: %s",
+					ver,
+					mig.Path,
+				)
+			}
+			err = s.repo.Exec(context.Background(), query)
+			err = redactMigrationVariableExecutionError(mig.Query, err)
 
-			if err != nil && !mig.AllowError {
-				return n, lastVersion, errors.Wrapf(err, "migration(%d) query failed: %s, file: %s", ver, mig.Query, mig.Path)
+			if err != nil {
+				s.log.Error().Msgf("not executed query: \n%s\n for %s, version: %d, file: %s", mig.Query, name, ver, mig.Path)
+				if !mig.AllowError {
+					return n, lastVersion, errors.Wrapf(err, "migration(%d) query failed: %s, file: %s", ver, mig.Query, mig.Path)
+				}
 			}
 
 			if curVersion < ver {
 				if err = s.repo.UpdateServiceVersion(context.Background(), name, ver); err != nil {
-					return n, lastVersion, errors.Wrapf(err, "cannot update migration_service, ver: %d, file: %s", ver, mig.Path)
+					return n, lastVersion, errors.Wrapf(err, "cannot update migration_services, ver: %d, file: %s", ver, mig.Path)
 				}
 			}
 
@@ -218,7 +268,7 @@ func (s *Set) Apply(name string, priority, minVersion, curVersion int) (int, int
 }
 
 // GetSQL returns SQL statement for specified service with version > minVersion.
-func (s *Set) GetSQL(name string, priority, minVersion int) (sql string, err error) {
+func (s *Set) GetSQL(name string, priority int, minVersion int) (sql string, err error) {
 	migrations := s.serviceMigrations(name, priority, minVersion)
 
 	if len(migrations) == 0 {
@@ -249,7 +299,7 @@ func (s *Set) GetSQL(name string, priority, minVersion int) (sql string, err err
 }
 
 // ApplyAll applies all migrations for all services.
-func (s *Set) ApplyAll(skipVersionCheck bool) (int, error) {
+func (s *Set) ApplyAll(skipVersionCheck bool, envVersion string) (int, error) {
 	var (
 		n, ver, minVersion, curVersion int
 		err                            error
@@ -272,7 +322,7 @@ func (s *Set) ApplyAll(skipVersionCheck bool) (int, error) {
 				minVersion = curVersion
 			}
 
-			num, lastVersion, err := s.Apply(service, priority, minVersion, curVersion)
+			num, lastVersion, err := s.Apply(service, priority, minVersion, curVersion, envVersion)
 			if err != nil {
 				s.log.Error().Err(err).Msgf("failed to apply migrations for %s", service)
 				return n, fmt.Errorf("failed to apply migrations for %s", service)
@@ -314,7 +364,7 @@ func (s *Set) FakeAll() (int, error) {
 
 		if curVersion < version {
 			if err := s.repo.UpdateServiceVersion(context.Background(), name, version); err != nil {
-				return n, errors.Wrapf(err, "cannot update migration_service %s, ver: %d", name, version)
+				return n, errors.Wrapf(err, "cannot update migration_services %s, ver: %d", name, version)
 			}
 		}
 		n++

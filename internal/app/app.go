@@ -7,7 +7,7 @@ import (
 
 	"github.com/pkg/errors"
 	"github.com/webdevelop-pro/go-common/configurator"
-	"github.com/webdevelop-pro/go-common/logger"
+	"github.com/webdevelop-pro/lib/logger"
 	"github.com/webdevelop-pro/migration-service/internal/adapters"
 	"github.com/webdevelop-pro/migration-service/internal/domain/migration"
 )
@@ -17,13 +17,21 @@ const pkgName = "migration"
 type App struct {
 	log  logger.Logger
 	repo adapters.Repository
+	cfg  *GeneralConfig
 	set  *migration.Set
 }
 
 func New(c *configurator.Configurator, repo adapters.Repository) *App {
+	cfg := &GeneralConfig{}
+	l := logger.NewComponentLogger(pkgName, nil)
+
+	if err := configurator.NewConfiguration(cfg); err != nil {
+		l.Fatal().Err(err).Msg("failed to get configuration of server")
+	}
 	return &App{
-		log:  logger.NewDefaultComponent(pkgName),
+		log:  l,
 		repo: repo,
+		cfg:  cfg,
 		set:  migration.New(repo),
 	}
 }
@@ -35,7 +43,7 @@ func (a *App) ApplyAll(dir string) error {
 		a.log.Error().Err(err).Msgf("can't get migration data from directory: %s", dir)
 		panic(err)
 	}
-	n, err := a.set.ApplyAll(false)
+	n, err := a.set.ApplyAll(false, a.cfg.EnvName)
 	if err != nil {
 		a.log.Error().Err(err).Msg("failed to apply all migrations")
 		return err
@@ -54,7 +62,7 @@ func (a *App) Apply(ctx context.Context, serviceName string) (int, error) {
 		return 0, errors.Wrap(err, "failed to get current service version")
 	}
 
-	n, lastVersion, err := a.set.Apply(serviceName, -1, ver, ver)
+	n, lastVersion, err := a.set.Apply(serviceName, -1, ver, ver, a.cfg.EnvName)
 	if err != nil {
 		return 0, errors.Wrap(err, "failed to apply migrations")
 	}
@@ -104,7 +112,7 @@ func (a *App) Init(ctx context.Context) error {
 func (a *App) ForceApply(args []string) error {
 	a.set.ClearData()
 	a.getMigrationDataFromAppArgs(args)
-	n, err := a.set.ApplyAll(true)
+	n, err := a.set.ApplyAll(true, a.cfg.EnvName)
 	if err != nil {
 		a.log.Error().Err(err).Msg("failed to force apply all migrations")
 		return err

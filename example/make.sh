@@ -6,7 +6,7 @@ COMPANY=webdevelop-pro
 SERVICE=migration-service
 
 build() {
-  curl https://github.com/webdevelop-pro/migration-service/releases/download/v0.3/app-v0.3-`uname`-`uname -m`.tar.gz | tar xz > app
+  curl https://github.com/webdevelop-pro/migration-service/releases/download/v1.0.2/app-v1.0.2-`uname`-`uname -m`.tar.gz | tar xz > app
   chmod +x app
 }
 
