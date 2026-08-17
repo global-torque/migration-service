@@ -3,11 +3,11 @@ package postgres
 import (
 	"context"
 
-	"github.com/jackc/pgconn"
-	"github.com/jackc/pgx/v4"
+	"github.com/jackc/pgx/v5"
 	"github.com/pkg/errors"
 	"github.com/webdevelop-pro/go-common/configurator"
 	"github.com/webdevelop-pro/go-common/db"
+	"github.com/webdevelop-pro/go-common/logger"
 	"github.com/webdevelop-pro/migration-service/internal/domain/migration_log"
 )
 
@@ -19,8 +19,15 @@ type Repository struct {
 
 // New returns new DB instance.
 func New(c *configurator.Configurator) *Repository {
+	poolConfig := db.GetConfigPool(c)
+	// Migration SQL may contain rendered secrets. The shared pgx tracer records
+	// complete SQL statements, so it must remain disabled for this repository
+	// regardless of DB_LOG_LEVEL.
+	poolConfig.ConnConfig.Tracer = nil
+	pool := db.NewPoolFromConfig(poolConfig)
+
 	return &Repository{
-		db: db.New(c),
+		db: db.NewDB(pool, logger.NewComponentLogger("migration-db", nil)),
 	}
 }
 
@@ -39,7 +46,6 @@ func (r *Repository) UpdateServiceVersion(ctx context.Context, name string, ver 
 func (r *Repository) GetServiceVersion(ctx context.Context, name string) (int, error) {
 	const query = `SELECT version FROM migration_services WHERE name=$1`
 
-	var pgErr *pgconn.PgError
 	var ver int
 
 	err := r.db.QueryRow(ctx, query, name).Scan(&ver)
@@ -47,14 +53,17 @@ func (r *Repository) GetServiceVersion(ctx context.Context, name string) (int, e
 		if errors.Is(err, pgx.ErrNoRows) {
 			return 0, nil
 		}
-		if errors.As(err, &pgErr) {
-			if pgErr.Code == NO_TABLE_CODE {
-				if err := r.CreateMigrationTable(context.Background()); err != nil {
-					return 0, errors.Wrapf(err, "query %s failed, %s ", query, pgErr.Message)
-				}
-				return r.GetServiceVersion(ctx, name)
+		// ToDo: Research why
+		// reflect.TypeOf(err) return *pgconn.PgError
+		// but errors.As(err, &pgErr) return false ...
+		// if errors.As(err, &pgErr) {
+		// if pgErr.Code == NO_TABLE_CODE {
+		sErr := err.Error()
+		if len(sErr) > 45 && sErr[0:45] == "ERROR: relation \"migration_services\" does not" {
+			if createErr := r.CreateMigrationTable(context.Background()); createErr != nil {
+				return 0, errors.Wrapf(createErr, "failed to initialize migration tables after query error: %s", err)
 			}
-			return 0, errors.Wrapf(err, "query %s failed, %s ", query, pgErr.Message)
+			return r.GetServiceVersion(ctx, name)
 		}
 		return 0, errors.Wrapf(err, "query %s failed, %s ", query, name)
 	}
@@ -64,14 +73,11 @@ func (r *Repository) GetServiceVersion(ctx context.Context, name string) (int, e
 
 // Exec executes query
 func (r *Repository) Exec(ctx context.Context, sql string, arguments ...interface{}) error {
-	return r.db.BeginFunc(
-		ctx,
-		func(tx pgx.Tx) error {
-			_, err := tx.Exec(ctx, sql, arguments...)
+	return pgx.BeginFunc(ctx, r.db, func(tx pgx.Tx) error {
+		_, err := tx.Exec(ctx, sql, arguments...)
 
-			return err
-		},
-	)
+		return err
+	})
 }
 
 // CreateMigrationTable will create a migration table
@@ -95,8 +101,6 @@ CREATE OR REPLACE TRIGGER set_timestamp_migration_services
   BEFORE UPDATE ON migration_services
   FOR EACH ROW
   EXECUTE PROCEDURE update_at_set_timestamp();
-COMMIT;
-
 CREATE TABLE IF NOT EXISTS migration_service_logs
 (
     id                      SERIAL PRIMARY KEY,
@@ -115,6 +119,7 @@ CREATE TABLE IF NOT EXISTS migration_service_logs
 );
 
 ALTER TABLE public.migration_service_logs DROP CONSTRAINT IF EXISTS migration_service_logs_pk;
+ALTER TABLE public.migration_service_logs DROP CONSTRAINT IF EXISTS migration_service_logs_complex_uindex;
 ALTER TABLE public.migration_service_logs
     ADD CONSTRAINT migration_service_logs_pk
         UNIQUE (migration_services_name, priority, version, file_name);
@@ -127,7 +132,6 @@ EXECUTE PROCEDURE update_at_set_timestamp();
 
 CREATE INDEX IF NOT EXISTS migration_service_logs_hash_index
     on migration_service_logs (hash);
-COMMIT;
 `
 	_, err := r.db.Exec(ctx, query)
 
@@ -146,6 +150,13 @@ func (r *Repository) WriteMigrationServiceLog(ctx context.Context, log migration
 	_, err := r.db.Exec(ctx, query, log.MigrationServiceName, log.Priority, log.Version, log.FileName, log.SQL, log.Hash)
 
 	if err != nil {
+		sErr := err.Error()
+		if len(sErr) > 55 && sErr[0:55] == "ERROR: relation \"migration_service_logs\" does not exist" {
+			if createErr := r.CreateMigrationTable(context.Background()); createErr != nil {
+				return errors.Wrapf(createErr, "failed to initialize migration tables after query error: %s", err)
+			}
+			return r.WriteMigrationServiceLog(ctx, log)
+		}
 		return errors.Wrapf(err, "query %s failed, params: MigrationServiceName = %s, Priority = %d, "+
 			"Version = %d, FileName = %s, SQL = %s, Hash = %s", query, log.MigrationServiceName, log.Priority,
 			log.Version, log.FileName, log.SQL, log.Hash)

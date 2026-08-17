@@ -1,23 +1,28 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"fmt"
+	"io"
+	"os"
+	"os/exec"
+	"strings"
 	"testing"
 
-	"github.com/jackc/pgx/v4"
+	"github.com/jackc/pgx/v5"
 	"github.com/rs/zerolog/log"
 	"github.com/webdevelop-pro/go-common/configurator"
-	"github.com/webdevelop-pro/go-common/db"
 	"github.com/webdevelop-pro/go-common/logger"
+	"github.com/webdevelop-pro/lib/db"
 	"github.com/webdevelop-pro/migration-service/internal/adapters/repository/postgres"
 	"github.com/webdevelop-pro/migration-service/internal/app"
 	"github.com/webdevelop-pro/migration-service/internal/domain/migration"
 )
 
 func testInit() (logger.Logger, *configurator.Configurator, *postgres.Repository, *app.App, *db.DB, context.Context) {
-	_log := logger.NewDefault()
-	c := configurator.New()
+	_log := logger.DefaultStdoutLogger("info", nil)
+	c := configurator.NewConfigurator()
 	pg := postgres.New(c)
 	_migration := app.New(c, pg)
 	rawPG := db.New(c)
@@ -259,8 +264,7 @@ func TestFakeApply(t *testing.T) {
 	}
 
 	checkResultsByService(t, rawPG, _log, "user_users", 1)
-
-	// Second phase - try to fake apply migrations without actually applying
+	// Second phase - try to apply migration with lower version
 	if err := _migration.FakeApply([]string{"./migrations/TestFakeApply/SecondPhase"}); err != nil {
 		_log.Fatal().Err(err).Msg("cannot apply migrations")
 	}
@@ -283,4 +287,181 @@ func TestMigrationLog(t *testing.T) {
 	checkResultsByService(t, rawPG, _log, "user_users", 3)
 	checkRecordsCount(t, rawPG, _log, "migration_service_logs", 3)
 	checkValueResults(t, rawPG, _log, "03_add_bitint.sql", "migration_service_logs", "file_name", 3)
+}
+
+func TestMigrationVariables(t *testing.T) {
+	const secret = "pa'ssword; DROP TABLE migration_services; -- $migration_variable$"
+	t.Setenv("MIGRATION_TEST_SECRET_VALUE", secret)
+	t.Setenv("MIGRATION_TEST_DYNAMIC_NUMBER", "42")
+	t.Setenv("MIGRATION_TEST_EMPTY_VALUE", "")
+
+	_log, _, _, _migration, rawPG, _ := testInit()
+	if _, err := rawPG.Exec(context.Background(), "DROP TABLE IF EXISTS migration_variables"); err != nil {
+		t.Fatalf("cannot drop migration_variables: %v", err)
+	}
+	t.Cleanup(func() {
+		_, _ = rawPG.Exec(context.Background(), "DROP TABLE IF EXISTS migration_variables")
+	})
+
+	if err := _migration.ApplyAll("./migrations/TestMigrationVariables"); err != nil {
+		_log.Error().Err(err).Msg("cannot apply migration variables test")
+		t.Fatal(err)
+	}
+
+	var gotSecret, gotEmpty string
+	var gotNumber int
+	err := rawPG.QueryRow(
+		context.Background(),
+		"SELECT secret_value, dynamic_number, empty_value FROM migration_variables LIMIT 1",
+	).Scan(&gotSecret, &gotNumber, &gotEmpty)
+	if err != nil {
+		t.Fatalf("cannot read migration_variables: %v", err)
+	}
+	if gotSecret != secret || gotNumber != 42 || gotEmpty != "" {
+		t.Fatalf("inserted values = (%q, %d, %q), want (%q, 42, empty)", gotSecret, gotNumber, gotEmpty, secret)
+	}
+
+	var loggedSQL string
+	err = rawPG.QueryRow(
+		context.Background(),
+		"SELECT sql FROM migration_service_logs WHERE migration_services_name = 'variables' AND version = 1",
+	).Scan(&loggedSQL)
+	if err != nil {
+		t.Fatalf("cannot read migration log: %v", err)
+	}
+	if strings.Contains(loggedSQL, secret) || !strings.Contains(loggedSQL, "${MIGRATION_TEST_SECRET_VALUE}") {
+		t.Fatalf("migration log does not retain the secret-free placeholder: %q", loggedSQL)
+	}
+}
+
+// TestMigrationLog checks writing logs to migration_service_logs table
+func TestRequiredEnvInvertion(t *testing.T) {
+	// we will create new migrations for user_user service and verify
+	// if all records was written to migration_service_log
+	os.Setenv("ENV_NAME", "master")
+	_log, _, _, _migration, rawPG, _ := testInit()
+	_log.Debug().Msg("checking required env comment")
+
+	// apply migrations for non master branch
+	if err := _migration.ApplyAll("./migrations/RequiredEnv/BranchInvertion"); err != nil {
+		_log.Fatal().Err(err).Msg("cannot apply migrations")
+	}
+
+	ver := 1
+	query := fmt.Sprintf("SELECT version FROM migration_services WHERE name='%s' ORDER by id DESC LIMIT 1", "user_users")
+	err := rawPG.QueryRow(context.Background(), query).Scan(&ver)
+	if err == nil {
+		t.Errorf("query should return an error cause we should not have any migrations for user_users")
+	}
+	if err.Error() != "no rows in result set" {
+		t.Errorf("query should return an error cause we should not have any migrations for user_users")
+	}
+
+	os.Setenv("ENV_NAME", "dev")
+	_log, _, _, _migration, rawPG, _ = testInit()
+	// apply migrations for non master branch
+	if err := _migration.ApplyAll("./migrations/RequiredEnv/BranchInvertion"); err != nil {
+		_log.Fatal().Err(err).Msg("cannot apply migrations")
+	}
+
+	checkResultsByService(t, rawPG, _log, "user", 1)
+	// checkRecordsCount(t, rawPG, _log, "migration_service_logs", 0)
+	// checkValueResults(t, rawPG, _log, "01_user_users.sql", "migration_service_logs", "file_name", 2)
+}
+
+func TestRequiredEnvMultipleBranch(t *testing.T) {
+	// we will create new migrations for user_user service and verify
+	// if all records was written to migration_service_log
+	os.Setenv("ENV_NAME", "master")
+	_log, _, _, _migration, rawPG, _ := testInit()
+	_log.Debug().Msg("checking required env comment")
+
+	// apply migrations for non master branch
+	if err := _migration.ApplyAll("./migrations/RequiredEnv/MultipleBranches"); err != nil {
+		_log.Fatal().Err(err).Msg("cannot apply migrations")
+	}
+
+	ver := 1
+	query := fmt.Sprintf("SELECT version FROM migration_services WHERE name='%s' ORDER by id DESC LIMIT 1", "user_users")
+	err := rawPG.QueryRow(context.Background(), query).Scan(&ver)
+	if err == nil {
+		t.Errorf("query should return an error cause we should not have any migrations for user_users")
+	}
+	if err.Error() != "no rows in result set" {
+		t.Errorf("query should return an error cause we should not have any migrations for user_users")
+	}
+
+	os.Setenv("ENV_NAME", "stage")
+	_log, _, _, _migration, rawPG, _ = testInit()
+	// apply migrations for non master branch
+	if err := _migration.ApplyAll("./migrations/RequiredEnv/MultipleBranches"); err != nil {
+		_log.Fatal().Err(err).Msg("cannot apply migrations")
+	}
+
+	checkResultsByService(t, rawPG, _log, "user", 1)
+	// checkRecordsCount(t, rawPG, _log, "migration_service_logs", 0)
+	// checkValueResults(t, rawPG, _log, "01_user_users.sql", "migration_service_logs", "file_name", 2)
+}
+
+func TestExitCode(t *testing.T) {
+	// We will run migration with a bad sql
+	// to verify return code
+
+	_log := logger.DefaultStdoutLogger("info", nil)
+	cmd := exec.Command("go", "run", "cmd/server/main.go", "--apply-only")
+	cmd.Env = os.Environ()
+
+	file, err := os.Open("../.example.env")
+	if err != nil {
+		_log.Error().Err(err).Msg("cannot read default env file")
+		t.Fail()
+		return
+	}
+	defer file.Close()
+
+	reader := bufio.NewReader(file)
+
+	for {
+		line, _, err := reader.ReadLine()
+
+		if err == io.EOF {
+			break
+		}
+		sline := string(line)
+		// choose different migration dir
+		if len(sline) > 10 && sline[0:10] == "MIGRATION_" {
+			cmd.Env = append(cmd.Env, "MIGRATION_DIR=./tests/migrations/TestErrorCode")
+		} else {
+			cmd.Env = append(cmd.Env, string(line))
+		}
+	}
+
+	// The `Output` method executes the command and
+	// collects the output, returning its value
+	_, err = cmd.Output()
+	if err == nil {
+		_log.Error().Err(fmt.Errorf("migration should return an error code")).Msg("must had an error")
+		// if there was any error, print it here
+		t.Fail()
+	}
+}
+
+func TestMigrationSubFolderOrder(t *testing.T) {
+	// Make sure any subfolders are run after main files
+
+	_log, _, _, _migration, rawPG, _ := testInit()
+	_log.Debug().Msg("checking migration order")
+
+	// we have a bug with random map keys during for loop
+	// so we need to run migration for several times
+	for x := 0; x < 20; x++ {
+		_log, _, _, _migration, rawPG, _ = testInit()
+		// apply migrations for non master branch
+		if err := _migration.ApplyAll("./migrations/TestTriggerFolder"); err != nil {
+			_log.Fatal().Err(err).Msg("cannot apply migrations")
+		}
+
+		checkResultsByService(t, rawPG, _log, "user_users", 2)
+		checkResultsByService(t, rawPG, _log, "user_users_trigger", 1)
+	}
 }

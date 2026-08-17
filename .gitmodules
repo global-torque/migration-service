@@ -1,0 +1,6 @@
+[submodule "pkg/logger"]
+	path = pkg/logger
+	url = git@github.com:webdevelop-pro/go-logger.git
+[submodule "pkg/lib"]
+	path = pkg/lib
+	url = git@github.com:webdevelop-pro/go-common

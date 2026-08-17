@@ -10,6 +10,7 @@ import (
 type Migration struct {
 	AllowError bool
 	NoAuto     bool
+	EnvRegex   string
 	Path       string
 	Query      string
 	Hash       string
@@ -20,6 +21,7 @@ func NewMigration(query string, path string) Migration {
 
 	mig := Migration{
 		AllowError: false,
+		EnvRegex:   "",
 		Query:      query,
 		Path:       path,
 		Hash:       hash,
@@ -44,6 +46,9 @@ func NewMigration(query string, path string) Migration {
 						mig.AllowError = true
 						break
 					}
+				} else if vals[0] == "required_env" {
+					mig.EnvRegex = strings.Trim(vals[1], " ")
+					break
 				}
 			}
 		}
