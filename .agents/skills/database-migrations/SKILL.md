@@ -149,35 +149,33 @@ MIGRATION_DIR=./migrations/ ./app --apply-only=true
 
 ## Dynamic Values In Migration SQL
 
-Use migration variables when a migration needs a secret or another value that
-must be supplied at execution time. The migration-service process expands
-environment variables matching `MIGRATION_[A-Z0-9_]+` when it applies an
-eligible migration:
+Use migration variables when a migration needs a value that must be supplied at
+execution time. The migration-service process replaces environment variables
+matching `MIGRATION_[A-Z0-9_]+` with raw bytes when it applies an eligible
+migration:
 
 ```sql
 INSERT INTO service_credentials (service_name, api_key, timeout_seconds)
-VALUES ('payments', ${MIGRATION_PAYMENTS_API_KEY}, ${MIGRATION_TIMEOUT_SECONDS}::integer);
+VALUES ('payments', '${MIGRATION_PAYMENTS_API_KEY}', ${MIGRATION_TIMEOUT_SECONDS}::integer);
 ```
 
 Follow these rules:
 
-- Write `${MIGRATION_NAME}` unquoted as a standalone SQL value. Never write
-  `'${MIGRATION_NAME}'`; the runner supplies the PostgreSQL string literal.
-- Use variables only for values. Do not use them as table/column names,
-  identifiers, keywords, operators, or raw SQL fragments.
-- Supply each referenced variable to the migration-service process through its
-  shell, container, or deployment secret configuration. An unset variable is a
-  fatal error before SQL execution; an explicitly set empty value is valid.
-- Add an explicit PostgreSQL cast where useful, such as `::integer`, `::uuid`,
-  or `::jsonb`. PostgreSQL performs the conversion from the rendered string
-  literal.
-- Keep placeholders out of comments, quoted strings, quoted identifiers,
-  dollar-quoted blocks, and function/`DO` bodies. Put the dynamic value in a
-  top-level DML statement. The runner also rejects a placeholder that touches
-  an identifier character.
-- If a variable-bearing migration contains a backslash in an ordinary SQL
-  string, change that string to an explicit `E'...'` escape string so parsing
-  does not depend on `standard_conforming_strings`.
+- `${MIGRATION_NAME}` is replaced byte-for-byte in one pass. It may be used in
+  values, identifiers, comments, quoted strings, dollar-quoted blocks,
+  function/`DO` bodies, adjacent text, or raw SQL.
+- The runner does not quote, escape, cast, or validate the replacement as SQL.
+  Supply any required SQL syntax yourself, including quotes and casts. For a
+  string literal, include the quotes yourself; the runner does not escape
+  apostrophes. Do not assume automatic protection from SQL metacharacters.
+- This is a backward-incompatible contract: older releases rendered a
+  PostgreSQL string literal and rejected non-standalone or quoted-context
+  placeholders. Rewrite migrations that depended on that behavior explicitly.
+- Repeated placeholders reuse the first lookup result. An explicitly set empty
+  value is valid; an unset variable is fatal before SQL execution. Values with
+  NUL bytes are rejected.
+- A marker introduced by a replacement value is not recursively expanded. This
+  includes both `${MIGRATION_*}` and `{{ ENV_NAME }}` markers.
 - A migration skipped by `required_env` does not resolve its variables.
   Variable-resolution failures remain fatal even with `allow_error: true`.
 
@@ -187,7 +185,7 @@ hashes stable across environments and avoids persisting the value in runner
 logs. `--final-sql` output containing placeholders is an audit/debug view, not
 SQL that can be executed directly.
 
-The resolved SQL must still reach PostgreSQL. Database statement, error,
+The raw resolved SQL must still reach PostgreSQL. Database statement, error,
 duration, audit, or activity logging can expose a value outside the migration
 runner. Before using this feature for secrets, restrict database roles and
 review server-side logging and `pg_stat_activity` access. Do not use textual
