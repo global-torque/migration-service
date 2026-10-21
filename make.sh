@@ -24,25 +24,6 @@ init() {
   PKG_LIST=$(go list ./... | grep -v /lib/)
 }
 
-require_integration_database() {
-  if [ "${MIGRATION_RUNNER_POSTGRES_TEST:-}" != "1" ]; then
-    echo "error: test integration requires MIGRATION_RUNNER_POSTGRES_TEST=1 and explicit disposable PostgreSQL DB_* configuration" >&2
-    return 1
-  fi
-
-  missing=""
-  for variable in DB_TYPE DB_DATABASE DB_USER DB_HOST DB_PORT DB_PASSWORD DB_SSL_MODE; do
-    eval "value=\${$variable:-}"
-    if [ -z "$value" ]; then
-      missing="$missing $variable"
-    fi
-  done
-  if [ -n "$missing" ]; then
-    echo "error: test integration missing DB configuration:$missing" >&2
-    return 1
-  fi
-}
-
 build() {
   go build -ldflags "-s -w -X main.repository=${REPOSITORY} -X main.revisionID=${GIT_COMMIT} -X main.version=${BUILD_DATE}:${GIT_COMMIT} -X main.service=${SERVICE_NAME}" -o ./app ./cmd/server/*.go && chmod +x ./app
 }
@@ -74,7 +55,6 @@ test)
     ;;
 
   integration)
-    require_integration_database || exit 1
     init
     go test -run=Integration -count=1 ${PKG_LIST}
     ;;
