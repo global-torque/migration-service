@@ -147,6 +147,33 @@ cd ../i-migration-service
 MIGRATION_DIR=./migrations/ ./app --apply-only=true
 ```
 
+Normal apply progress is priority-aware and materialized in the runner-owned
+`migration_service_priorities` table. Service-wide initialization is protected
+by a PostgreSQL advisory transaction lock. Existing explicit rows are
+authoritative. A new priority starts at zero when the service has logs
+elsewhere. When exactly one priority has logs, its seed is the greater of that
+logged high-water and the legacy aggregate; requested unlogged priorities seed
+at zero. With no logs, only the lowest sorted requested priority inherits the
+legacy aggregate and all other requested priorities seed at zero. With multiple
+logged priorities, a positive aggregate is ambiguous
+when it exceeds any logged priority high-water and must be explicitly seeded
+rather than guessed. An aggregate at or below every logged high-water is
+compatible. Explicit rows remain authoritative but cannot be below their exact
+priority log high-water; missing requested rows inherit that exact priority
+high-water or zero.
+Aggregate versions are monotonic. Hash checking remains exact per file and
+does not auto-ignore gaps, partial same-version logs, or mismatches.
+
+`--final-sql` uses a repeatable-read, read-only resolver and never creates
+tracking relations or progress rows. Missing-table recovery for mutating Get,
+Advance, and fake operations is bounded to one SQLSTATE `42P01` schema-create
+attempt and one whole-operation retry.
+
+`--fake` records canonical per-file log rows without executing SQL. It processes
+services, priorities, versions, and files deterministically, commits one
+service batch atomically, rejects mismatched existing rows without overwriting
+them, and counts only fully committed services.
+
 ## Dynamic Values In Migration SQL
 
 Use migration variables when a migration needs a value that must be supplied at

@@ -9,7 +9,9 @@ Migration service stands as a beacon of resilience and security in the realm of 
 ## Structure
 All migrations files located in the `migrations/` folder.
 Migration service reads file one by one in alphabetical order and execute it one by one.
-In order to work properly migration service require `migration_services` and `migration_service_logs` tables to be created first:
+In order to work properly migration service requires `migration_services`,
+`migration_service_logs`, and the runner-owned `migration_service_priorities`
+table to be created first:
 ```sh
 set -a && source .dev.env && go run cmd/server/main.go --init
 ```
@@ -50,6 +52,38 @@ will apply all new migrations locally
 - Once github PR reviewed and merged to one of those branches service will execute new migrations automatically.
 
 [Check](example/) full usage example [here](example/)
+
+## Migration progress and fake apply
+
+Normal progress is tracked per `(service, priority)` in the runner-owned
+`migration_service_priorities` table. Initialization is serialized with a
+service-scoped PostgreSQL advisory lock. Existing explicit rows are
+authoritative; a missing priority in an already-logged service starts at zero.
+For a legacy service with no logs, the lowest sorted requested priority inherits
+`migration_services.version` and the other requested priorities start at zero.
+When exactly one priority has logs, its seed is
+the greater of that logged high-water and the legacy aggregate; requested
+unlogged priorities seed at zero. With multiple logged priorities, an
+aggregate above any logged priority high-water is ambiguous and fails rather
+than guessing; an aggregate at or below every logged high-water is compatible.
+Seed ambiguous priorities explicitly before retrying. Explicit rows remain
+authoritative but are rejected if below their exact priority log high-water;
+missing requested rows inherit that priority's exact log high-water or zero.
+Aggregate updates are monotonic and never lower the legacy value. Exact
+per-file hash checking remains unchanged, so gaps, same-version partial logs,
+and mismatches are reported rather than silently reconciled.
+
+`--final-sql` resolves progress in one repeatable-read, read-only snapshot. It
+does not create tracking tables or progress rows and handles partially
+bootstrapped tracking schemas using the relations that exist.
+
+`--fake` writes canonical per-file log identities without executing migration
+SQL. Each service batch initializes priority rows and is deterministic and
+atomic: missing identities are inserted, identical identities are no-ops,
+mismatches fail without changing the existing row, priority and aggregate
+high-water values advance only after all identities pass, and the batch is
+retried at most once when PostgreSQL reports a missing tracking relation. The
+reported fake count is the number of fully committed services.
 
 
 ## Env variables
@@ -157,7 +191,9 @@ set -a && source .dev.env && go run cmd/server/main.go --force ./migrations/01_u
 ```
 
 ### --fake
-do not apply any migration but mark according migrations in `migration_services` table as completed. Can accept multiply files or dir paths
+do not apply migration SQL; record canonical per-file log identities and the
+aggregate service version. Processing is atomic per service and can accept
+multiple files or directories of migrations.
 ```sh 
 set -a && source .dev.env && go run cmd/server/main.go --fake ./migrations/01_user_user ./migrations/02_email_emails/02_add_id.sql
 ```

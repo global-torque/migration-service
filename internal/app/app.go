@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"strings"
 
 	"github.com/pkg/errors"
 	"github.com/webdevelop-pro/go-common/configurator"
@@ -57,24 +58,23 @@ func (a *App) Apply(ctx context.Context, serviceName string) (int, error) {
 		return 0, fmt.Errorf("service '%s' not found", serviceName)
 	}
 
-	ver, err := a.repo.GetServiceVersion(ctx, serviceName)
-	if err != nil {
-		return 0, errors.Wrap(err, "failed to get current service version")
+	priorities := a.set.ServicePriorities(serviceName)
+	if err := a.repo.InitializeServicePriorities(ctx, serviceName, priorities); err != nil {
+		return 0, errors.Wrap(err, "failed to initialize service priorities")
 	}
 
-	n, lastVersion, err := a.set.Apply(serviceName, -1, ver, ver, a.cfg.EnvName)
-	if err != nil {
-		return 0, errors.Wrap(err, "failed to apply migrations")
-	}
-
-	if lastVersion > ver {
-		if err := a.repo.UpdateServiceVersion(ctx, serviceName, lastVersion); err != nil {
-			a.log.Error().Err(err).Msg("failed to bump service version")
+	n := 0
+	for _, priority := range priorities {
+		ver, err := a.repo.GetServiceVersion(ctx, serviceName, priority)
+		if err != nil {
+			return 0, errors.Wrap(err, "failed to get current service version")
 		}
-	}
 
-	if err != nil {
-		return 0, errors.Wrap(err, "failed to encode response")
+		applied, _, err := a.set.Apply(serviceName, priority, ver, ver, a.cfg.EnvName)
+		if err != nil {
+			return 0, errors.Wrap(err, "failed to apply migrations")
+		}
+		n += applied
 	}
 
 	return n, nil
@@ -92,17 +92,23 @@ func (a *App) GetSQL(ctx context.Context, dir string, serviceName string) (sql s
 		return "", fmt.Errorf("service '%s' not found", serviceName)
 	}
 
-	ver, err := a.repo.GetServiceVersion(ctx, serviceName)
+	priorities := a.set.ServicePriorities(serviceName)
+	versions, err := a.repo.ResolveServiceVersions(ctx, serviceName, priorities)
 	if err != nil {
-		return "", errors.Wrap(err, "failed to get current service version")
+		return "", errors.Wrap(err, "failed to resolve current service versions")
 	}
 
-	sql, err = a.set.GetSQL(serviceName, -1, ver)
-	if err != nil {
-		return "", errors.Wrap(err, "failed to get migrations")
+	var builder strings.Builder
+	for _, priority := range priorities {
+		ver := versions[priority]
+		prioritySQL, err := a.set.GetSQL(serviceName, priority, ver)
+		if err != nil {
+			return "", errors.Wrap(err, "failed to get migrations")
+		}
+		builder.WriteString(prioritySQL)
 	}
 
-	return
+	return builder.String(), nil
 }
 
 func (a *App) Init(ctx context.Context) error {
