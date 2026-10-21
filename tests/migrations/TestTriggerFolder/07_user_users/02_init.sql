@@ -1,4 +1,4 @@
-CREATE TABLE user_users 
+CREATE TABLE user_users
 (
   id              SERIAL PRIMARY KEY,
 

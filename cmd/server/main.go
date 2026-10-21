@@ -110,8 +110,6 @@ func RunApp(sd fx.Shutdowner, _app *app.App, c *configurator.Configurator, lc fx
 	} else {
 		sd.Shutdown(fx.ExitCode(errorToint(err)))
 	}
-	// Run server
-	RunHttpServer(lc, srv)
 }
 
 func RunMigrations(sd fx.Shutdowner, _app *app.App, c *configurator.Configurator) error {

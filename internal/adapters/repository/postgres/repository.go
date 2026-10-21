@@ -3,7 +3,6 @@ package postgres
 import (
 	"context"
 
-	"github.com/jackc/pgconn"
 	"github.com/jackc/pgx/v5"
 	"github.com/pkg/errors"
 	"github.com/webdevelop-pro/go-common/configurator"
@@ -47,7 +46,6 @@ func (r *Repository) UpdateServiceVersion(ctx context.Context, name string, ver 
 func (r *Repository) GetServiceVersion(ctx context.Context, name string) (int, error) {
 	const query = `SELECT version FROM migration_services WHERE name=$1`
 
-	var pgErr *pgconn.PgError
 	var ver int
 
 	err := r.db.QueryRow(ctx, query, name).Scan(&ver)
@@ -62,8 +60,8 @@ func (r *Repository) GetServiceVersion(ctx context.Context, name string) (int, e
 		// if pgErr.Code == NO_TABLE_CODE {
 		sErr := err.Error()
 		if len(sErr) > 45 && sErr[0:45] == "ERROR: relation \"migration_services\" does not" {
-			if err := r.CreateMigrationTable(context.Background()); err != nil {
-				return 0, errors.Wrapf(err, "query %s failed, %s ", query, pgErr.Message)
+			if createErr := r.CreateMigrationTable(context.Background()); createErr != nil {
+				return 0, errors.Wrapf(createErr, "failed to initialize migration tables after query error: %s", err)
 			}
 			return r.GetServiceVersion(ctx, name)
 		}
@@ -103,7 +101,6 @@ CREATE OR REPLACE TRIGGER set_timestamp_migration_services
   BEFORE UPDATE ON migration_services
   FOR EACH ROW
   EXECUTE PROCEDURE update_at_set_timestamp();
-
 CREATE TABLE IF NOT EXISTS migration_service_logs
 (
     id                      SERIAL PRIMARY KEY,
@@ -121,9 +118,10 @@ CREATE TABLE IF NOT EXISTS migration_service_logs
     updated_at              timestamptz            NOT NULL DEFAULT now()
 );
 
+ALTER TABLE public.migration_service_logs DROP CONSTRAINT IF EXISTS migration_service_logs_pk;
 ALTER TABLE public.migration_service_logs DROP CONSTRAINT IF EXISTS migration_service_logs_complex_uindex;
 ALTER TABLE public.migration_service_logs
-    ADD CONSTRAINT migration_service_logs_complex_uindex
+    ADD CONSTRAINT migration_service_logs_pk
         UNIQUE (migration_services_name, priority, version, file_name);
 
 CREATE OR REPLACE TRIGGER migration_service_logs_updated_at_timestamp
@@ -146,7 +144,6 @@ CREATE INDEX IF NOT EXISTS migration_service_logs_hash_index
 
 // WriteMigrationServiceLog inserts row to migration_service_logs
 func (r *Repository) WriteMigrationServiceLog(ctx context.Context, log migration_log.MigrationServicesLog) error {
-	var pgErr *pgconn.PgError
 	const query = `INSERT INTO migration_service_logs (migration_services_name, priority, version, file_name, "sql", hash) 
 		VALUES ($1, $2, $3, $4, $5, $6) ON CONFLICT(migration_services_name, priority, version, file_name) DO UPDATE 
 		SET "sql"=$5, hash=$6`
@@ -155,8 +152,8 @@ func (r *Repository) WriteMigrationServiceLog(ctx context.Context, log migration
 	if err != nil {
 		sErr := err.Error()
 		if len(sErr) > 55 && sErr[0:55] == "ERROR: relation \"migration_service_logs\" does not exist" {
-			if err := r.CreateMigrationTable(context.Background()); err != nil {
-				return errors.Wrapf(err, "query %s failed, %s ", query, pgErr.Message)
+			if createErr := r.CreateMigrationTable(context.Background()); createErr != nil {
+				return errors.Wrapf(createErr, "failed to initialize migration tables after query error: %s", err)
 			}
 			return r.WriteMigrationServiceLog(ctx, log)
 		}
