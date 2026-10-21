@@ -29,7 +29,7 @@ First line in every file can be pass configuration for the migration service.
 
 __Example__:
 ```sql
---- allow_error: false, required_env: !master 
+--- allow_error: false, required_env: !master
 CREATE TABLE migration_services (
   id serial NOT NULL PRIMARY KEY,
   name varchar NOT NULL UNIQUE,

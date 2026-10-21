@@ -192,7 +192,6 @@ func (s *Set) Apply(name string, priority, minVersion, curVersion int, envName s
 
 	for _, ver := range versions {
 		for _, mig := range migrations[ver] {
-
 			var err error
 			var regexRes bool
 			execute := true
