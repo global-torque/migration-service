@@ -18,23 +18,11 @@ type variableTestRepository struct {
 	logs        []migration_log.MigrationServicesLog
 }
 
-func (r *variableTestRepository) GetServiceVersion(context.Context, string, int) (int, error) {
+func (r *variableTestRepository) GetServiceVersion(context.Context, string) (int, error) {
 	return 0, nil
 }
 
-func (r *variableTestRepository) ResolveServiceVersions(_ context.Context, _ string, priorities []int) (map[int]int, error) {
-	versions := make(map[int]int, len(priorities))
-	for _, priority := range priorities {
-		versions[priority] = 0
-	}
-	return versions, nil
-}
-
-func (r *variableTestRepository) InitializeServicePriorities(context.Context, string, []int) error {
-	return nil
-}
-
-func (r *variableTestRepository) AdvanceServiceVersion(_ context.Context, _ string, _ int, version int) error {
+func (r *variableTestRepository) UpdateServiceVersion(_ context.Context, _ string, version int) error {
 	r.versions = append(r.versions, version)
 	return nil
 }
@@ -50,15 +38,6 @@ func (r *variableTestRepository) Exec(_ context.Context, query string, _ ...inte
 
 func (r *variableTestRepository) WriteMigrationServiceLog(_ context.Context, log migration_log.MigrationServicesLog) error {
 	r.logs = append(r.logs, log)
-	return nil
-}
-
-func (r *variableTestRepository) FakeMigrationService(
-	context.Context,
-	string,
-	int,
-	[]migration_log.MigrationServicesLog,
-) error {
 	return nil
 }
 

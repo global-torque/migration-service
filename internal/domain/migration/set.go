@@ -84,17 +84,11 @@ func (s *Set) services(priority int) []string {
 
 	switch priority {
 	case -1:
-		seen := make(map[string]struct{})
 		for priority := range s.data {
 			for k := range s.data[priority] {
-				if _, exists := seen[k]; exists {
-					continue
-				}
-				seen[k] = struct{}{}
 				services = append(services, k)
 			}
 		}
-		sort.Strings(services)
 	default:
 		if priorityServices, ok := s.data[priority]; ok {
 			keys := make([]string, 0, len(priorityServices))
@@ -130,21 +124,6 @@ func (s *Set) priorities() []int {
 		i++
 	}
 
-	s.Unlock()
-
-	sort.Ints(priorities)
-	return priorities
-}
-
-// ServicePriorities returns sorted priorities containing migrations for a service.
-func (s *Set) ServicePriorities(name string) []int {
-	s.Lock()
-	priorities := make([]int, 0)
-	for priority, services := range s.data {
-		if _, exists := services[name]; exists {
-			priorities = append(priorities, priority)
-		}
-	}
 	s.Unlock()
 
 	sort.Ints(priorities)
@@ -261,8 +240,10 @@ func (s *Set) Apply(name string, priority, minVersion, curVersion int, envName s
 				}
 			}
 
-			if err = s.repo.AdvanceServiceVersion(context.Background(), name, priority, ver); err != nil {
-				return n, lastVersion, errors.Wrapf(err, "cannot update migration service progress, priority: %d, ver: %d, file: %s", priority, ver, mig.Path)
+			if curVersion < ver {
+				if err = s.repo.UpdateServiceVersion(context.Background(), name, ver); err != nil {
+					return n, lastVersion, errors.Wrapf(err, "cannot update migration_services, ver: %d, file: %s", ver, mig.Path)
+				}
 			}
 
 			sLog := migration_log.MigrationServicesLog{
@@ -321,29 +302,17 @@ func (s *Set) GetSQL(name string, priority int, minVersion int) (sql string, err
 // ApplyAll applies all migrations for all services.
 func (s *Set) ApplyAll(skipVersionCheck bool, envVersion string) (int, error) {
 	var (
-		n, minVersion, curVersion int
-		err                       error
+		n, ver, minVersion, curVersion int
+		err                            error
 	)
-	initialized := make(map[string]struct{})
+	lastVersions := make(map[string]int)
 
 	pariorities := s.priorities()
 	for _, priority := range pariorities {
 		services := s.services(priority)
 		for _, service := range services {
-			if _, ok := initialized[service]; !ok {
-				if err = s.repo.InitializeServicePriorities(
-					context.Background(),
-					service,
-					s.ServicePriorities(service),
-				); err != nil {
-					s.log.Error().Err(err).Msgf("failed to initialize service priorities for %s", service)
-					return n, fmt.Errorf("failed to initialize service priorities for %s: %w", service, err)
-				}
-				initialized[service] = struct{}{}
-			}
-
 			minVersion = -1
-			curVersion, err = s.repo.GetServiceVersion(context.Background(), service, priority)
+			curVersion, err = s.repo.GetServiceVersion(context.Background(), service)
 
 			if err != nil && priority > 0 && service != "migration" {
 				s.log.Error().Err(err).Msgf("failed to get service version for %s", service)
@@ -354,61 +323,50 @@ func (s *Set) ApplyAll(skipVersionCheck bool, envVersion string) (int, error) {
 				minVersion = curVersion
 			}
 
-			num, _, err := s.Apply(service, priority, minVersion, curVersion, envVersion)
+			num, lastVersion, err := s.Apply(service, priority, minVersion, curVersion, envVersion)
 			if err != nil {
 				s.log.Error().Err(err).Msgf("failed to apply migrations for %s", service)
 				return n, fmt.Errorf("failed to apply migrations for %s", service)
 			}
 
 			n += num
+			if lastVersion > ver {
+				if curLastVersion, ok := lastVersions[service]; !ok || lastVersion > curLastVersion {
+					lastVersions[service] = lastVersion
+				}
+			}
 		}
 	}
 
 	return n, nil
 }
 
-// FakeAll marks all migrations as finished without applying them.
+// FakeAll marked all migrations as finished without applying them
 func (s *Set) FakeAll() (int, error) {
+	servicesWithLastVersion := make(map[string]int)
 	n := 0
 
-	for _, name := range s.services(-1) {
-		logs := make([]migration_log.MigrationServicesLog, 0)
-		aggregateVersion := -1
-		priorities := s.ServicePriorities(name)
-		if len(priorities) == 0 {
-			continue
-		}
-		for _, priority := range priorities {
-			serviceMigrations, exists := s.data[priority][name]
-			if !exists {
-				continue
-			}
-
-			versions := make([]int, 0, len(serviceMigrations))
-			for version := range serviceMigrations {
-				versions = append(versions, version)
-			}
-			sort.Ints(versions)
-			for _, version := range versions {
-				if version > aggregateVersion {
-					aggregateVersion = version
-				}
-				for _, mig := range serviceMigrations[version] {
-					logs = append(logs, migration_log.MigrationServicesLog{
-						MigrationServiceName: name,
-						Priority:             priority,
-						Version:              version,
-						FileName:             filepath.Base(mig.Path),
-						SQL:                  mig.Query,
-						Hash:                 mig.Hash,
-					})
+	for priority := range s.data {
+		for name, service := range s.data[priority] {
+			for ver := range service {
+				if ver >= servicesWithLastVersion[name] {
+					servicesWithLastVersion[name] = ver
 				}
 			}
 		}
+	}
 
-		if err := s.repo.FakeMigrationService(context.Background(), name, aggregateVersion, logs); err != nil {
-			s.log.Error().Err(err).Msgf("failed to fake migrations for %s", name)
-			return n, errors.Wrapf(err, "failed to fake migrations for %s", name)
+	for name, version := range servicesWithLastVersion {
+		curVersion, err := s.repo.GetServiceVersion(context.Background(), name)
+		if err != nil && name != "migration" {
+			s.log.Error().Err(err).Msgf("failed to get service version for %s", name)
+			return n, fmt.Errorf("failed to get service version for %s", name)
+		}
+
+		if curVersion < version {
+			if err := s.repo.UpdateServiceVersion(context.Background(), name, version); err != nil {
+				return n, errors.Wrapf(err, "cannot update migration_services %s, ver: %d", name, version)
+			}
 		}
 		n++
 	}

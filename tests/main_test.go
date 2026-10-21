@@ -7,8 +7,6 @@ import (
 	"io"
 	"os"
 	"os/exec"
-	"path/filepath"
-	"reflect"
 	"strings"
 	"testing"
 
@@ -41,10 +39,6 @@ func testInit() (logger.Logger, *configurator.Configurator, *postgres.Repository
 	_, err = rawPG.Exec(context.Background(), "DROP TABLE IF EXISTS migration_service_logs")
 	if err != nil {
 		_log.Fatal().Err(err).Msg("can't drop table migration_service_logs from DB")
-	}
-	_, err = rawPG.Exec(context.Background(), "DROP TABLE IF EXISTS migration_service_priorities")
-	if err != nil {
-		_log.Fatal().Err(err).Msg("can't drop table migration_service_priorities from DB")
 	}
 	_, err = rawPG.Exec(context.Background(), "DROP TABLE IF EXISTS migration_services")
 	if err != nil {
@@ -123,21 +117,6 @@ func checkRecordsCount(t *testing.T, rawPG *db.DB, log logger.Logger, tableName 
 	if val != expVal {
 		log.Fatal().Msgf("rows count didn't match %d!=%d", val, expVal)
 		t.Error()
-	}
-}
-
-func seedPriorityTrackLog(t *testing.T, rawPG *db.DB, service string, priority, version int, path string) {
-	t.Helper()
-	queryBytes, err := os.ReadFile(path)
-	if err != nil {
-		t.Fatalf("read priority-track migration %s: %v", path, err)
-	}
-	mig := migration.NewMigration(string(queryBytes), path)
-	if _, err := rawPG.Exec(context.Background(), `INSERT INTO migration_service_logs
-		(migration_services_name, priority, version, file_name, sql, hash)
-		VALUES ($1, $2, $3, $4, $5, $6)`,
-		service, priority, version, filepath.Base(path), mig.Query, mig.Hash); err != nil {
-		t.Fatalf("seed priority-track log %s: %v", path, err)
 	}
 }
 
@@ -220,153 +199,6 @@ func TestMigrationPriorities(t *testing.T) {
 	}
 
 	checkResults(t, rawPG, _log, "email_emails", 2)
-}
-
-func TestPriorityTracks(t *testing.T) {
-	_log, _, pg, _migration, rawPG, ctx := testInit()
-	const (
-		service    = "user_user_invitations"
-		stateTable = "priority_track_regression_state"
-	)
-	if _, err := rawPG.Exec(ctx, "DROP TABLE IF EXISTS "+stateTable); err != nil {
-		t.Fatalf("reset priority-track state: %v", err)
-	}
-	t.Cleanup(func() {
-		_, _ = rawPG.Exec(context.Background(), "DROP TABLE IF EXISTS "+stateTable)
-	})
-	if err := pg.CreateMigrationTable(ctx); err != nil {
-		t.Fatalf("create priority-track migration tables: %v", err)
-	}
-	if _, err := rawPG.Exec(ctx, "CREATE TABLE "+stateTable+" (marker text NOT NULL)"); err != nil {
-		t.Fatalf("create priority-track state: %v", err)
-	}
-	if _, err := rawPG.Exec(ctx, `INSERT INTO migration_services(name, version)
-		VALUES ($1, 3)`, service); err != nil {
-		t.Fatalf("seed priority-track aggregate: %v", err)
-	}
-	fixtureRoot := "./migrations/TestPriorityTracks"
-	seedPriorityTrackLog(t, rawPG, service, 16, 1, filepath.Join(fixtureRoot, "16_user_user_invitations", "01_create_state.sql"))
-	seedPriorityTrackLog(t, rawPG, service, 16, 3, filepath.Join(fixtureRoot, "16_user_user_invitations", "03_p16.sql"))
-	seedPriorityTrackLog(t, rawPG, service, 17, 2, filepath.Join(fixtureRoot, "17_user_user_invitations", "02_p17.sql"))
-	if _, err := rawPG.Exec(ctx, `INSERT INTO migration_service_priorities
-		(migration_services_name, priority, version)
-		VALUES ($1, 16, 3), ($1, 17, 2)`, service); err != nil {
-		t.Fatalf("seed priority-track explicit state: %v", err)
-	}
-	var beforeCount int
-	if err := rawPG.QueryRow(ctx, `SELECT count(*) FROM migration_service_logs WHERE migration_services_name = $1`, service).Scan(&beforeCount); err != nil {
-		t.Fatal(err)
-	}
-	if beforeCount != 3 {
-		t.Fatalf("priority-track initial log count = %d, want 3", beforeCount)
-	}
-
-	if err := _migration.ApplyAll(fixtureRoot); err != nil {
-		t.Fatalf("apply priority-track fixture: %v", err)
-	}
-	var markers []string
-	rows, err := rawPG.Query(ctx, "SELECT marker FROM "+stateTable+" ORDER BY marker")
-	if err != nil {
-		t.Fatal(err)
-	}
-	for rows.Next() {
-		var marker string
-		if err := rows.Scan(&marker); err != nil {
-			rows.Close()
-			t.Fatal(err)
-		}
-		markers = append(markers, marker)
-	}
-	rows.Close()
-	if err := rows.Err(); err != nil {
-		t.Fatal(err)
-	}
-	if want := []string{"p17-v3"}; !reflect.DeepEqual(markers, want) {
-		t.Fatalf("priority-track executed markers = %v, want %v", markers, want)
-	}
-
-	var loggedFile, loggedSQL, loggedHash string
-	if err := rawPG.QueryRow(ctx, `SELECT file_name, sql, hash
-		FROM migration_service_logs
-		WHERE migration_services_name = $1 AND priority = 17 AND version = 3`, service).
-		Scan(&loggedFile, &loggedSQL, &loggedHash); err != nil {
-		t.Fatalf("read priority-track v3 log: %v", err)
-	}
-	p17v3Path := filepath.Join(fixtureRoot, "17_user_user_invitations", "03_p17.sql")
-	p17v3Bytes, err := os.ReadFile(p17v3Path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	p17v3 := migration.NewMigration(string(p17v3Bytes), p17v3Path)
-	if loggedFile != filepath.Base(p17v3Path) || loggedSQL != p17v3.Query || loggedHash != p17v3.Hash {
-		t.Fatalf("priority-track v3 log = (%q, %q, %q), want (%q, %q, %q)", loggedFile, loggedSQL, loggedHash, filepath.Base(p17v3Path), p17v3.Query, p17v3.Hash)
-	}
-
-	var aggregate int
-	if err := rawPG.QueryRow(ctx, `SELECT version FROM migration_services WHERE name = $1`, service).Scan(&aggregate); err != nil {
-		t.Fatal(err)
-	}
-	if aggregate != 3 {
-		t.Fatalf("priority-track aggregate = %d, want 3", aggregate)
-	}
-	var priority16Version, priority17Version int
-	if err := rawPG.QueryRow(ctx, `SELECT version FROM migration_service_priorities
-		WHERE migration_services_name = $1 AND priority = 16`, service).Scan(&priority16Version); err != nil {
-		t.Fatal(err)
-	}
-	if err := rawPG.QueryRow(ctx, `SELECT version FROM migration_service_priorities
-		WHERE migration_services_name = $1 AND priority = 17`, service).Scan(&priority17Version); err != nil {
-		t.Fatal(err)
-	}
-	if priority16Version != 3 || priority17Version != 3 {
-		t.Fatalf("priority-track explicit state = (%d, %d), want (3, 3)", priority16Version, priority17Version)
-	}
-	allEqual, differences, err := _migration.CheckMigrationHash([]string{fixtureRoot})
-	if err != nil {
-		t.Fatalf("priority-track hash check: %v", err)
-	}
-	if !allEqual || len(differences) != 0 {
-		t.Fatalf("priority-track hash check = (%t, %v), want clean", allEqual, differences)
-	}
-
-	var finalCount int
-	if err := rawPG.QueryRow(ctx, `SELECT count(*) FROM migration_service_logs WHERE migration_services_name = $1`, service).Scan(&finalCount); err != nil {
-		t.Fatal(err)
-	}
-	if finalCount != 4 {
-		t.Fatalf("priority-track final log count = %d, want 4", finalCount)
-	}
-	if err := _migration.ApplyAll(fixtureRoot); err != nil {
-		t.Fatalf("second priority-track apply: %v", err)
-	}
-	var afterCount int
-	if err := rawPG.QueryRow(ctx, `SELECT count(*) FROM migration_service_logs WHERE migration_services_name = $1`, service).Scan(&afterCount); err != nil {
-		t.Fatal(err)
-	}
-	if afterCount != finalCount {
-		t.Fatalf("second priority-track apply changed log count from %d to %d", finalCount, afterCount)
-	}
-	var afterMarkers []string
-	rows, err = rawPG.Query(ctx, "SELECT marker FROM "+stateTable+" ORDER BY marker")
-	if err != nil {
-		t.Fatal(err)
-	}
-	for rows.Next() {
-		var marker string
-		if err := rows.Scan(&marker); err != nil {
-			rows.Close()
-			t.Fatal(err)
-		}
-		afterMarkers = append(afterMarkers, marker)
-	}
-	rows.Close()
-	if err := rows.Err(); err != nil {
-		t.Fatal(err)
-	}
-	if want := []string{"p17-v3"}; !reflect.DeepEqual(afterMarkers, want) {
-		t.Fatalf("second priority-track apply changed markers to %v, want %v", afterMarkers, want)
-	}
-	_log.Debug().Msg("priority-track regression passed")
 }
 
 // TestMigrationApplied checks applied migrations commited to db
