@@ -7,7 +7,7 @@ CREATE TABLE migration_variables (
 
 INSERT INTO migration_variables (secret_value, dynamic_number, empty_value)
 VALUES (
-    ${MIGRATION_TEST_SECRET_VALUE},
+    $migration_test_secret$${MIGRATION_TEST_SECRET_VALUE}$migration_test_secret$,
     ${MIGRATION_TEST_DYNAMIC_NUMBER},
-    ${MIGRATION_TEST_EMPTY_VALUE}
+    '${MIGRATION_TEST_EMPTY_VALUE}'
 );

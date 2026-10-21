@@ -58,12 +58,17 @@ check `.example.env` file
 ### Variables in migration SQL
 
 Environment variables whose names start with `MIGRATION_` can be inserted as
-values during migration execution. Use an unquoted `${MIGRATION_NAME}`
-placeholder as a standalone value token in the SQL file:
+raw bytes during migration execution. A `${MIGRATION_NAME}` placeholder may
+appear in any SQL lexical context, including quoted strings, identifiers,
+comments, dollar-quoted bodies, adjacent text, or raw SQL:
 
 ```sql
 INSERT INTO service_credentials (service_name, api_key, timeout_seconds)
-VALUES ('payments', ${MIGRATION_PAYMENTS_API_KEY}, ${MIGRATION_TIMEOUT_SECONDS});
+VALUES ('payments', '${MIGRATION_PAYMENTS_API_KEY}', ${MIGRATION_TIMEOUT_SECONDS});
+
+DO $body$ BEGIN
+  EXECUTE 'GRANT USAGE ON SCHEMA public TO ${MIGRATION_RUNTIME_ROLE}';
+END $body$;
 ```
 
 Variable names must match `MIGRATION_[A-Z0-9_]+`. Make every referenced
@@ -76,30 +81,24 @@ export MIGRATION_TIMEOUT_SECONDS="30"
 MIGRATION_DIR=./migrations/ ./app --apply-only=true
 ```
 
-Every replacement is a PostgreSQL string literal. Add an explicit cast when
-the intended type would otherwise be unclear, for example
-`${MIGRATION_TIMEOUT_SECONDS}::integer`, `${MIGRATION_TENANT_ID}::uuid`, or
-`${MIGRATION_RULES_JSON}::jsonb`. Do not put quotes around the placeholder;
-`'${MIGRATION_PAYMENTS_API_KEY}'` is rejected.
+The runner performs one regex replacement pass and does not quote, escape,
+cast, or otherwise validate the value as SQL. Supply any required SQL syntax
+yourself, including quotes or casts. For a string literal, include the quotes
+yourself; the runner does not escape apostrophes. This is an intentional backward-
+incompatible contract change: earlier releases generated PostgreSQL string
+literals and rejected quoted, commented, dollar-quoted, adjacent, and
+identifier-context placeholders. Existing migrations that relied on automatic
+quoting must be rewritten explicitly before using this behavior. There is no
+automatic SQL safety validation or quoting.
 
-The runner renders each value as a PostgreSQL string literal, so quotes,
-newlines, and SQL-like content in a value cannot change the SQL structure when
-the placeholder passes this validation.
-PostgreSQL will coerce the literal when the destination is another type, such
-as an integer, UUID, or JSON column. Placeholders are for values only; they
-cannot be used for identifiers or raw SQL fragments, and they must not be
-surrounded by single quotes. The runner rejects placeholders inside line or
-block comments, single-quoted strings, double-quoted identifiers, and
-dollar-quoted data or function bodies. It also rejects placeholders touching
-an identifier character. To avoid depending on the session's
-`standard_conforming_strings` setting, a variable-bearing migration also
-rejects backslashes inside ordinary SQL strings; use an explicit `E'...'`
-escape string when needed. Put dynamic procedural values in a top-level DML
-statement rather than inside a `DO` or function body.
+Repeated placeholders reuse the first lookup result. An explicitly set empty
+value is accepted. An unset variable fails the migration before SQL execution,
+and a value containing a NUL byte is rejected. Replacement text is not
+processed recursively: a `${MIGRATION_*}` marker introduced by a value remains
+unchanged. The same applies to `{{ ENV_NAME }}` text introduced by a value.
 
-An unset variable fails the migration before its SQL is sent to PostgreSQL. An
-explicitly set empty value is allowed. Variable-resolution errors are always
-fatal, even when the migration uses `allow_error: true`. Migration hashes,
+Variable-resolution errors are always fatal, even when the migration uses
+`allow_error: true`. Migration hashes,
 migration-service application logs, rows in `migration_service_logs`, and the
 `--final-sql` output retain the placeholder rather than storing the resolved
 value. PostgreSQL execution error details are redacted by the runner because
@@ -132,8 +131,10 @@ CREATE ROLE svc_{{ ENV_NAME }}_queue_api NOLOGIN;
 The runner renders this marker only immediately before execution. `ENV_NAME`
 must be set and match `[a-z][a-z0-9_]*`; the complete generated identifier must
 be at most 63 bytes. Unknown, nested, quoted, commented, or dollar-quoted
-template markers are rejected. This is the only supported identifier
-interpolation—use `${MIGRATION_*}` only for standalone SQL values.
+template markers are rejected. This renderer runs before `${MIGRATION_*}` raw
+replacement, so `{{ ENV_NAME }}` introduced by a migration variable is not
+rendered. `${MIGRATION_*}` is intentionally independent and has no automatic
+identifier or SQL validation.
 For marker-bearing SQL, an ordinary single-quoted string containing a
 backslash is also rejected because its parsing depends on
 `standard_conforming_strings`; use an explicit `E'...'` escape string.

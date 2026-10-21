@@ -53,15 +53,13 @@ func (e *migrationVariableExecutionError) Unwrap() error {
 	return e.cause
 }
 
-// expandMigrationVariables replaces MIGRATION_* placeholders with PostgreSQL
-// string literals. The placeholder must not be surrounded by SQL quotes.
+// expandMigrationVariables replaces MIGRATION_* placeholders with their raw
+// environment values in a single pass. The placeholder may occur in any SQL
+// lexical context.
 func expandMigrationVariables(query string) (string, error) {
-	matches := migrationVariablePattern.FindAllStringSubmatchIndex(query, -1)
+	matches := migrationVariablePattern.FindAllStringSubmatch(query, -1)
 	if len(matches) == 0 {
 		return query, nil
-	}
-	if err := validateMigrationVariablePositions(query, matches); err != nil {
-		return "", err
 	}
 
 	values := make(map[string]string, len(matches))
@@ -69,7 +67,7 @@ func expandMigrationVariables(query string) (string, error) {
 	seen := make(map[string]struct{}, len(matches))
 
 	for _, match := range matches {
-		name := query[match[2]:match[3]]
+		name := match[1]
 		if _, ok := seen[name]; ok {
 			continue
 		}
@@ -92,142 +90,10 @@ func expandMigrationVariables(query string) (string, error) {
 
 	expanded := migrationVariablePattern.ReplaceAllStringFunc(query, func(placeholder string) string {
 		name := placeholder[2 : len(placeholder)-1]
-		return postgresStringLiteral(query, values[name])
+		return values[name]
 	})
 
 	return expanded, nil
-}
-
-// validateMigrationVariablePositions accepts placeholders only as standalone
-// SQL value tokens. In particular, it prevents a generated dollar-quote tag
-// from being absorbed into an adjacent PostgreSQL identifier and prevents
-// values containing newlines or quote delimiters from escaping comments or
-// quoted regions.
-func validateMigrationVariablePositions(query string, matches [][]int) error {
-	state := sqlStateNormal
-	blockCommentDepth := 0
-	dollarDelimiter := ""
-	singleQuoteBackslashEscapes := false
-	matchIndex := 0
-
-	for i := 0; i < len(query); {
-		if matchIndex < len(matches) && matches[matchIndex][0] <= i {
-			match := matches[matchIndex]
-			start := match[0]
-			end := match[1]
-			name := query[match[2]:match[3]]
-			if state != sqlStateNormal {
-				return fmt.Errorf(
-					"migration variable %s must be an unquoted standalone SQL value; found inside %s",
-					name,
-					state,
-				)
-			}
-			if start < i ||
-				(start > 0 && isPostgresIdentifierByte(query[start-1])) ||
-				(end < len(query) && isPostgresIdentifierByte(query[end])) {
-				return fmt.Errorf(
-					"migration variable %s must be separated from SQL identifiers",
-					name,
-				)
-			}
-
-			i = end
-			matchIndex++
-			continue
-		}
-
-		switch state {
-		case sqlStateNormal:
-			switch {
-			case strings.HasPrefix(query[i:], "--"):
-				state = sqlStateLineComment
-				i += 2
-			case strings.HasPrefix(query[i:], "/*"):
-				state = sqlStateBlockComment
-				blockCommentDepth = 1
-				i += 2
-			case query[i] == '\'':
-				state = sqlStateSingleQuotedString
-				singleQuoteBackslashEscapes = postgresEscapeStringPrefix(query, i)
-				i++
-			case query[i] == '"':
-				state = sqlStateDoubleQuotedIdentifier
-				i++
-			default:
-				if delimiter := postgresDollarQuoteDelimiter(query, i); delimiter != "" {
-					state = sqlStateDollarQuotedBody
-					dollarDelimiter = delimiter
-					i += len(delimiter)
-				} else {
-					i++
-				}
-			}
-
-		case sqlStateSingleQuotedString:
-			switch {
-			case query[i] == '\\' && !singleQuoteBackslashEscapes:
-				name := query[matches[0][2]:matches[0][3]]
-				return fmt.Errorf(
-					"migration variable %s cannot be safely validated with a backslash in an ordinary SQL string; use an E-prefixed string",
-					name,
-				)
-			case query[i] == '\\' && i+1 < len(query):
-				i += 2
-			case query[i] == '\'' && i+1 < len(query) && query[i+1] == '\'':
-				i += 2
-			case query[i] == '\'':
-				state = sqlStateNormal
-				singleQuoteBackslashEscapes = false
-				i++
-			default:
-				i++
-			}
-
-		case sqlStateDoubleQuotedIdentifier:
-			switch {
-			case query[i] == '"' && i+1 < len(query) && query[i+1] == '"':
-				i += 2
-			case query[i] == '"':
-				state = sqlStateNormal
-				i++
-			default:
-				i++
-			}
-
-		case sqlStateLineComment:
-			if query[i] == '\n' || query[i] == '\r' {
-				state = sqlStateNormal
-			}
-			i++
-
-		case sqlStateBlockComment:
-			switch {
-			case strings.HasPrefix(query[i:], "/*"):
-				blockCommentDepth++
-				i += 2
-			case strings.HasPrefix(query[i:], "*/"):
-				blockCommentDepth--
-				i += 2
-				if blockCommentDepth == 0 {
-					state = sqlStateNormal
-				}
-			default:
-				i++
-			}
-
-		case sqlStateDollarQuotedBody:
-			if strings.HasPrefix(query[i:], dollarDelimiter) {
-				state = sqlStateNormal
-				i += len(dollarDelimiter)
-				dollarDelimiter = ""
-			} else {
-				i++
-			}
-		}
-	}
-
-	return nil
 }
 
 func postgresDollarQuoteDelimiter(query string, start int) string {
@@ -274,21 +140,6 @@ func isPostgresTagByte(b byte) bool {
 
 func isPostgresIdentifierByte(b byte) bool {
 	return isPostgresTagByte(b) || b == '$'
-}
-
-// postgresStringLiteral uses a delimiter that occurs in neither the migration
-// nor the value, so arbitrary values cannot terminate the generated literal.
-func postgresStringLiteral(query, value string) string {
-	for suffix := 0; ; suffix++ {
-		delimiter := "$migration_variable$"
-		if suffix > 0 {
-			delimiter = fmt.Sprintf("$migration_variable_%d$", suffix)
-		}
-
-		if !strings.Contains(query, delimiter) && !strings.Contains(value, delimiter) {
-			return delimiter + value + delimiter
-		}
-	}
 }
 
 // redactMigrationVariableExecutionError prevents PostgreSQL error details from

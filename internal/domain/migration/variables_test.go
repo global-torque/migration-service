@@ -45,110 +45,114 @@ func (r *variableTestRepository) GetHashFromMigrationServiceLog(context.Context,
 	return "", nil
 }
 
-func TestUnitExpandMigrationVariables(t *testing.T) {
-	t.Setenv("MIGRATION_UNIT_SECRET", "pa'ssword; DROP TABLE important; --")
+func TestUnitExpandMigrationVariablesUsesRawValues(t *testing.T) {
+	secret := "pa'ssword; DROP TABLE important; --"
+	t.Setenv("MIGRATION_UNIT_SECRET", secret)
 	t.Setenv("MIGRATION_UNIT_NUMBER", "42")
 
 	query := "INSERT INTO settings (secret, retry_count, copy) VALUES " +
 		"(${MIGRATION_UNIT_SECRET}, ${MIGRATION_UNIT_NUMBER}, ${MIGRATION_UNIT_SECRET});"
+	want := "INSERT INTO settings (secret, retry_count, copy) VALUES " +
+		"(" + secret + ", 42, " + secret + ");"
 
 	expanded, err := expandMigrationVariables(query)
 	if err != nil {
 		t.Fatalf("expandMigrationVariables() error = %v", err)
 	}
-
-	wantSecret := "$migration_variable$pa'ssword; DROP TABLE important; --$migration_variable$"
-	if strings.Count(expanded, wantSecret) != 2 {
-		t.Fatalf("expanded query does not contain the safely quoted secret twice: %s", expanded)
-	}
-	if !strings.Contains(expanded, "$migration_variable$42$migration_variable$") {
-		t.Fatalf("expanded query does not contain the dynamic number: %s", expanded)
+	if expanded != want {
+		t.Fatalf("expandMigrationVariables() = %q, want %q", expanded, want)
 	}
 }
 
-func TestUnitExpandMigrationVariablesChoosesNonConflictingDelimiter(t *testing.T) {
-	t.Setenv("MIGRATION_UNIT_SECRET", "first $migration_variable$ second")
+func TestUnitExpandMigrationVariablesRendersDOGrantRaw(t *testing.T) {
+	t.Setenv("MIGRATION_RUNTIME_ROLE", "migration_runtime")
+	query := "DO $body$ BEGIN EXECUTE 'GRANT USAGE ON SCHEMA public TO ${MIGRATION_RUNTIME_ROLE}'; END $body$;"
+	want := "DO $body$ BEGIN EXECUTE 'GRANT USAGE ON SCHEMA public TO migration_runtime'; END $body$;"
 
-	expanded, err := expandMigrationVariables("SELECT ${MIGRATION_UNIT_SECRET}")
+	expanded, err := expandMigrationVariables(query)
 	if err != nil {
 		t.Fatalf("expandMigrationVariables() error = %v", err)
 	}
-
-	want := "$migration_variable_1$first $migration_variable$ second$migration_variable_1$"
-	if expanded != "SELECT "+want {
-		t.Fatalf("expanded query = %q, want %q", expanded, "SELECT "+want)
+	if expanded != want {
+		t.Fatalf("expandMigrationVariables() = %q, want %q", expanded, want)
 	}
 }
 
 func TestUnitExpandMigrationVariablesAllowsEmptyValues(t *testing.T) {
 	t.Setenv("MIGRATION_UNIT_EMPTY", "")
 
-	expanded, err := expandMigrationVariables("SELECT ${MIGRATION_UNIT_EMPTY}")
+	expanded, err := expandMigrationVariables("SELECT before${MIGRATION_UNIT_EMPTY}after")
 	if err != nil {
 		t.Fatalf("expandMigrationVariables() error = %v", err)
 	}
-	if expanded != "SELECT $migration_variable$$migration_variable$" {
-		t.Fatalf("expanded query = %q", expanded)
+	if expanded != "SELECT beforeafter" {
+		t.Fatalf("expandMigrationVariables() = %q, want %q", expanded, "SELECT beforeafter")
 	}
 }
 
-func TestUnitExpandMigrationVariablesRejectsUnsafeSQLContexts(t *testing.T) {
-	t.Setenv("MIGRATION_UNIT_UNSAFE", "'; DROP TABLE important; --\n$$ $body$ second line")
+func TestUnitExpandMigrationVariablesSupportsEverySQLContextAndAdjacency(t *testing.T) {
+	value := "raw'value; --\nsecond line"
+	t.Setenv("MIGRATION_UNIT_RAW", value)
 
-	tests := map[string]string{
-		"identifier before":          "SELECT 1 AS alias${MIGRATION_UNIT_UNSAFE};",
-		"identifier after":           "SELECT ${MIGRATION_UNIT_UNSAFE}suffix;",
-		"line comment":               "-- ${MIGRATION_UNIT_UNSAFE}\nSELECT 1;",
-		"nested block comment":       "/* outer /* ${MIGRATION_UNIT_UNSAFE} */ outer */ SELECT 1;",
-		"single quoted string":       "SELECT '${MIGRATION_UNIT_UNSAFE}';",
-		"double quoted identifier":   `SELECT "${MIGRATION_UNIT_UNSAFE}";`,
-		"named dollar body":          "DO $body$ BEGIN RAISE NOTICE ${MIGRATION_UNIT_UNSAFE}; END $body$;",
-		"unnamed dollar body":        "DO $$ BEGIN RAISE NOTICE ${MIGRATION_UNIT_UNSAFE}; END $$;",
-		"ordinary backslash string":  "SELECT '\\' || 'prefix ${MIGRATION_UNIT_UNSAFE}';",
-		"named tag after identifier": "SELECT 1 AS foo$tag$, $tag$ ${MIGRATION_UNIT_UNSAFE} $tag$;",
-		"empty tag after identifier": "SELECT 1 AS foo$$, $$ ${MIGRATION_UNIT_UNSAFE} $$;",
-	}
-
-	for name, query := range tests {
-		t.Run(name, func(t *testing.T) {
-			expanded, err := expandMigrationVariables(query)
-			if err == nil {
-				t.Fatalf("expandMigrationVariables() = %q, nil; want a position error", expanded)
-			}
-			if !strings.Contains(err.Error(), "MIGRATION_UNIT_UNSAFE") {
-				t.Fatalf("error %q does not name the unsafe variable", err)
-			}
-			if strings.Contains(err.Error(), "DROP TABLE") {
-				t.Fatalf("error %q leaks the resolved value", err)
-			}
-		})
-	}
-}
-
-func TestUnitExpandMigrationVariablesAcceptsValueAfterQuotedRegions(t *testing.T) {
-	t.Setenv("MIGRATION_UNIT_AFTER_QUOTES", "safe value")
-	query := "SELECT 'ordinary string', \"quoted identifier\", $body$function-like body$body$; " +
-		"INSERT INTO settings (value) VALUES (${MIGRATION_UNIT_AFTER_QUOTES}); -- trailing comment"
+	query := "SELECT '${MIGRATION_UNIT_RAW}', \"${MIGRATION_UNIT_RAW}\"; -- ${MIGRATION_UNIT_RAW}\n" +
+		"/* ${MIGRATION_UNIT_RAW} */ SELECT prefix${MIGRATION_UNIT_RAW}suffix; " +
+		"DO $body$ BEGIN RAISE NOTICE '${MIGRATION_UNIT_RAW}'; END $body$;"
+	want := "SELECT '" + value + "', \"" + value + "\"; -- " + value + "\n" +
+		"/* " + value + " */ SELECT prefix" + value + "suffix; " +
+		"DO $body$ BEGIN RAISE NOTICE '" + value + "'; END $body$;"
 
 	expanded, err := expandMigrationVariables(query)
 	if err != nil {
 		t.Fatalf("expandMigrationVariables() error = %v", err)
 	}
-	if !strings.Contains(expanded, "$migration_variable$safe value$migration_variable$") {
-		t.Fatalf("expanded query does not contain the rendered value: %q", expanded)
+	if expanded != want {
+		t.Fatalf("expandMigrationVariables() = %q, want %q", expanded, want)
 	}
 }
 
-func TestUnitExpandMigrationVariablesUnderstandsEscapeStrings(t *testing.T) {
-	t.Setenv("MIGRATION_UNIT_AFTER_ESCAPE_STRING", "safe value")
-	query := `SELECT E'escaped\' quote'; SELECT ${MIGRATION_UNIT_AFTER_ESCAPE_STRING};`
+func TestUnitExpandMigrationVariablesPreservesRawSpecialBytes(t *testing.T) {
+	value := "line\n\t\r\x01'\\$migration_variable$"
+	t.Setenv("MIGRATION_UNIT_SPECIAL", value)
 
-	expanded, err := expandMigrationVariables(query)
+	expanded, err := expandMigrationVariables("SELECT ${MIGRATION_UNIT_SPECIAL}")
 	if err != nil {
 		t.Fatalf("expandMigrationVariables() error = %v", err)
 	}
-	if !strings.Contains(expanded, "$migration_variable$safe value$migration_variable$") {
-		t.Fatalf("expanded query does not contain the rendered value: %q", expanded)
+	if expanded != "SELECT "+value {
+		t.Fatalf("expandMigrationVariables() = %q, want %q", expanded, "SELECT "+value)
+	}
+}
+
+func TestUnitExpandMigrationVariablesDoesNotReexpandIntroducedMarkers(t *testing.T) {
+	t.Setenv("MIGRATION_UNIT_INTRODUCED", "${MIGRATION_UNIT_OTHER}")
+	t.Setenv("MIGRATION_UNIT_OTHER", "expanded")
+
+	expanded, err := expandMigrationVariables("SELECT ${MIGRATION_UNIT_INTRODUCED}")
+	if err != nil {
+		t.Fatalf("expandMigrationVariables() error = %v", err)
+	}
+	if expanded != "SELECT ${MIGRATION_UNIT_OTHER}" {
+		t.Fatalf("expandMigrationVariables() = %q, want introduced marker unchanged", expanded)
+	}
+}
+
+func TestUnitApplyDoesNotRenderEnvironmentMarkerIntroducedByVariable(t *testing.T) {
+	t.Setenv("MIGRATION_UNIT_INTRODUCED_ENV", "{{ ENV_NAME }}")
+
+	repo := &variableTestRepository{}
+	set := New(repo)
+	mig := NewMigration(
+		"SELECT ${MIGRATION_UNIT_INTRODUCED_ENV}_{{ ENV_NAME }};",
+		"01_identifiers/01_marker.sql",
+	)
+	set.Add("identifiers", 1, 1, mig)
+
+	_, _, err := set.Apply("identifiers", 1, -1, 0, "dev")
+	if err != nil {
+		t.Fatalf("Set.Apply() error = %v", err)
+	}
+	if len(repo.execQueries) != 1 || repo.execQueries[0] != "SELECT {{ ENV_NAME }}_dev;" {
+		t.Fatalf("executed queries = %q, want introduced marker unchanged", repo.execQueries)
 	}
 }
 
@@ -165,29 +169,36 @@ func TestUnitExpandMigrationVariablesLeavesExistingDollarBodiesUnchanged(t *test
 }
 
 func TestUnitExpandMigrationVariablesRejectsUnsetValuesWithoutLeakingSecrets(t *testing.T) {
-	const missingName = "MIGRATION_UNIT_DEFINITELY_UNSET"
-	original, existed := os.LookupEnv(missingName)
-	if err := os.Unsetenv(missingName); err != nil {
-		t.Fatalf("os.Unsetenv() error = %v", err)
-	}
-	t.Cleanup(func() {
-		if existed {
-			_ = os.Setenv(missingName, original)
-		} else {
-			_ = os.Unsetenv(missingName)
+	const (
+		missingName       = "MIGRATION_UNIT_DEFINITELY_UNSET"
+		secondMissingName = "MIGRATION_UNIT_SECOND_UNSET"
+	)
+	for _, name := range []string{missingName, secondMissingName} {
+		original, existed := os.LookupEnv(name)
+		if err := os.Unsetenv(name); err != nil {
+			t.Fatalf("os.Unsetenv(%s) error = %v", name, err)
 		}
-	})
+		name, original, existed := name, original, existed
+		t.Cleanup(func() {
+			if existed {
+				_ = os.Setenv(name, original)
+			} else {
+				_ = os.Unsetenv(name)
+			}
+		})
+	}
 
 	const secret = "must-not-appear-in-errors"
 	t.Setenv("MIGRATION_UNIT_PRESENT", secret)
 	_, err := expandMigrationVariables(
-		"SELECT ${MIGRATION_UNIT_PRESENT}, ${" + missingName + "}",
+		"SELECT ${MIGRATION_UNIT_PRESENT}, ${" + secondMissingName + "}, ${" + missingName + "}, ${" + secondMissingName + "}",
 	)
 	if err == nil {
 		t.Fatal("expandMigrationVariables() error = nil, want an unset-variable error")
 	}
-	if !strings.Contains(err.Error(), missingName) {
-		t.Fatalf("error %q does not name the unset variable", err)
+	wantError := "migration variables are not set: " + secondMissingName + ", " + missingName
+	if err.Error() != wantError {
+		t.Fatalf("error = %q, want %q", err, wantError)
 	}
 	if strings.Contains(err.Error(), secret) {
 		t.Fatalf("error %q leaks a resolved variable", err)
@@ -195,7 +206,7 @@ func TestUnitExpandMigrationVariablesRejectsUnsetValuesWithoutLeakingSecrets(t *
 }
 
 func TestUnitApplyExecutesExpandedSQLButLogsOriginalSQL(t *testing.T) {
-	const secret = "audit-safe-secret"
+	const secret = "audit;--safe-secret"
 	t.Setenv("MIGRATION_UNIT_APPLY_SECRET", secret)
 
 	repo := &variableTestRepository{}
@@ -211,8 +222,9 @@ func TestUnitApplyExecutesExpandedSQLButLogsOriginalSQL(t *testing.T) {
 	if n != 1 || lastVersion != 1 {
 		t.Fatalf("Set.Apply() = (%d, %d), want (1, 1)", n, lastVersion)
 	}
-	if len(repo.execQueries) != 1 || !strings.Contains(repo.execQueries[0], secret) {
-		t.Fatalf("executed queries = %q, want one expanded query", repo.execQueries)
+	wantQuery := "INSERT INTO credentials (secret) VALUES (" + secret + ");"
+	if len(repo.execQueries) != 1 || repo.execQueries[0] != wantQuery {
+		t.Fatalf("executed queries = %q, want %q", repo.execQueries, wantQuery)
 	}
 	if len(repo.logs) != 1 || repo.logs[0].SQL != originalQuery {
 		t.Fatalf("migration logs = %#v, want original SQL", repo.logs)
@@ -259,26 +271,29 @@ func TestUnitApplyRejectsUnsetVariableBeforeRepositoryChanges(t *testing.T) {
 	}
 }
 
-func TestUnitApplyRejectsUnsafePlaceholderBeforeRepositoryChanges(t *testing.T) {
-	t.Setenv("MIGRATION_UNIT_UNSAFE_APPLY", "; DROP TABLE credentials; --")
+func TestUnitGetSQLRetainsCanonicalMigrationVariable(t *testing.T) {
+	const secret = "final-sql-secret"
+	t.Setenv("MIGRATION_UNIT_FINAL_SQL", secret)
 
 	repo := &variableTestRepository{}
 	set := New(repo)
-	mig := NewMigration(
-		"SELECT 1 AS alias${MIGRATION_UNIT_UNSAFE_APPLY};",
-		"01_credentials/01_insert.sql",
+	originalQuery := "INSERT INTO credentials (secret) VALUES (${MIGRATION_UNIT_FINAL_SQL});"
+	set.Add(
+		"credentials",
+		1,
+		1,
+		NewMigration(originalQuery, "01_credentials/01_insert.sql"),
 	)
-	set.Add("credentials", 1, 1, mig)
 
-	_, _, err := set.Apply("credentials", 1, -1, 0, "dev")
-	if err == nil || !strings.Contains(err.Error(), "must be separated") {
-		t.Fatalf("Set.Apply() error = %v, want an unsafe-position error", err)
+	got, err := set.GetSQL("credentials", 1, -1)
+	if err != nil {
+		t.Fatalf("Set.GetSQL() error = %v", err)
 	}
-	if len(repo.execQueries) != 0 || len(repo.versions) != 0 || len(repo.logs) != 0 {
-		t.Fatalf(
-			"repository changes = exec:%d versions:%d logs:%d, want all zero",
-			len(repo.execQueries), len(repo.versions), len(repo.logs),
-		)
+	if strings.TrimSpace(got) != originalQuery {
+		t.Fatalf("Set.GetSQL() = %q, want canonical %q", got, originalQuery)
+	}
+	if strings.Contains(got, secret) || !strings.Contains(got, "${MIGRATION_UNIT_FINAL_SQL}") {
+		t.Fatalf("Set.GetSQL() = %q, want placeholder without resolved value", got)
 	}
 }
 
